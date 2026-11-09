@@ -78,9 +78,21 @@ Skyward 自带的分区备份 / 恢复、OTA 包安装、擦除、SELinux 上下
 
 需要：bootloader 已解锁、设备是 TB322FC、`recovery_b` 是本文测试基线或相近的 TWRP。
 
+### 成品镜像
+
+从 [Releases](https://github.com/BeeHiyok/Y700-Gen4_skyward/releases) 下载：
+
+```text
+skyward-v0.2.0-TB322FC-recovery.img
+大小     104857600 字节（整分区）
+SHA-256  3fca684f2bfa559f2fd5df709eb67b8416e60ff7ac224e8fc0c507d6c6894665
+```
+
 ```bash
-# 1. 取得成品镜像（自己构建，见下一节），或从 Releases 下载
-# 2. 写入 recovery_b
+# 校验
+sha256sum skyward-v0.2.0-TB322FC-recovery.img
+
+# 写入 recovery_b
 adb push skyward-v0.2.0-TB322FC-recovery.img /data/local/tmp/skyward.img
 adb shell su -c 'dd if=/data/local/tmp/skyward.img of=/dev/block/by-name/recovery_b bs=4M'
 adb shell su -c 'sync'
