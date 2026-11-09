@@ -1,10 +1,29 @@
 # Skyward for Lenovo LEGION Y700 (4th Gen) — TB322FC
 
-把 [Skyward](https://github.com/kirklin/skyward) 移植到联想拯救者 Y700（第四代 / TB322FC）的补丁与工具。
+把 [Skyward](https://github.com/kirklin/skyward) 移植到联想拯救者 Y700（第四代 / TB322FC）的**完整源码树**，
+已包含移植改动，克隆下来即可直接编译。
 
 - **上游版本：Skyward v0.2.0**（commit `22528ba`，`chore: release 0.2.0`）
-- 本仓库只包含**移植所需的补丁、配置、ramdisk 覆盖文件和构建脚本**，不含上游源码
+- 本仓库 = 上游 v0.2.0 源码 + TB322FC 移植改动 + 设备配置 + 构建/打包脚本
 - 许可：GPL-3.0（与上游一致）
+- `patches/skyward-tb322fc.patch` 是相对上游 v0.2.0 的完整差异，便于对照审查
+
+### 仓库结构
+
+```text
+crates/                  上游源码 + 移植改动（crates/skyward/src/sd.rs 为本移植新增）
+devices/TB322FC.toml     本机配置（CPU 显示、SD 卡挂载点等）
+ramdisk/                 本移植改写的两个 ramdisk 文件
+  init.recovery.qcom.rc     crypto 初始化（KeyMint / Gatekeeper / SPU / Weaver）
+  system/etc/vintf/manifest.xml  framework VINTF 描述
+scripts/
+  build-binary.sh        编译 arm64 二进制
+  make-image.sh          从自己的 recovery_b 备份生成整分区镜像
+  port_tool.py           boot image / cpio / LZ4 / AVB 处理
+patches/                 相对上游 v0.2.0 的差异
+docs/HANDOFF.md          完整技术记录（内部修订号 v3.x 与上游版本无关）
+docs/upstream-README*.md 上游 Skyward 的原 README
+```
 
 ---
 
@@ -112,21 +131,31 @@ fastboot flash recovery_b <你自己的 recovery_b 备份.img>
 
 ## 从源码构建
 
-```bash
-# 1. 取上游 Skyward v0.2.0
-git clone --depth 1 --branch v0.2.0 https://github.com/kirklin/skyward.git
-export SKYWARD_SRC=$PWD/skyward
+克隆即可编译，无需再打补丁。
 
-# 2. 打补丁并编译 arm64 二进制
-#    需要 Rust stable、Android NDK r29、cargo-ndk
-#    rustup target add aarch64-linux-android
+```bash
+git clone https://github.com/BeeHiyok/Y700-Gen4_skyward.git
+cd Y700-Gen4_skyward
+
+# 依赖：Rust（rustup 安装的 stable）、Android NDK r29、cargo-ndk
+# rustup target add aarch64-linux-android  （脚本会自动执行）
+export ANDROID_NDK_HOME=/opt/android-ndk-r29
+
+# 1. 编译 arm64 二进制
 ./scripts/build-binary.sh ./skyward-tb322fc-recovery
 
-# 3. 用自己的 recovery_b 备份作为基底，生成整分区镜像
+# 2. 用自己的 recovery_b 备份作为基底，生成整分区镜像
 ./scripts/make-image.sh \
     ./recovery_b-stock.img \
     ./skyward-tb322fc-recovery \
     ./skyward-v0.2.0-TB322FC-recovery.img
+```
+
+**可复现性**：在干净目录里 `cargo ndk -t arm64-v8a --platform 30 build --locked --release -p skyward`
+产出的二进制与 Release 里的完全一致：
+
+```text
+SHA-256 1207e75f5d83aae74e8460802e7fa31d127a7c0a343ea7e0ff31af39f60d4484
 ```
 
 `make-image.sh` 会替换 ramdisk 里的：

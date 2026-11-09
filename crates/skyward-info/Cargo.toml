@@ -1,0 +1,17 @@
+[package]
+name = "skyward-info"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+libc = { workspace = true }
+rsproperties = { version = "0.6.0", features = ["builder"] }
+skyward-block = { path = "../skyward-block" }
+skyward-config = { path = "../skyward-config" }
+skyward-sys = { path = "../skyward-sys" }
+skyward-vab = { path = "../skyward-vab" }
+
+[dev-dependencies]
+tempfile = "3.27.0"
