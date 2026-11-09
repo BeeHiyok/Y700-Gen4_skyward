@@ -1,0 +1,9 @@
+# build output
+*.img
+skyward-tb322fc-recovery
+target/
+
+# editor / OS
+.DS_Store
+Thumbs.db
+*.swp

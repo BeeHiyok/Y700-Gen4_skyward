@@ -1,0 +1,50 @@
+# Stable v3.1 baseline for Lenovo LEGION Y700 (4th Gen), TB322FC.
+# Intentionally contains no service chain, WLAN, haptics or decryption
+# experiments: those caused HAL restarts, black-screen loops and USB loss in
+# v4/v5. Add one feature at a time after verifying stability.
+
+[device]
+codename = "TB322FC"
+brand = "Lenovo"
+model = "联想拯救者Y700（第四代）"
+ab = true
+os_version_prop = "ro.build.display.id"
+soc = { hans = "骁龙®8至尊版移动平台", hant = "Snapdragon® 8 Elite 行動平台", en = "Snapdragon® 8 Elite Mobile Platform" }
+
+[display]
+width = 1904
+height = 3040
+density = 440
+diagonal = 8.8
+corner_radius = 55
+
+[cpu]
+# The UI showed 8.64GHz even though sysfs and `info` read 4320000 kHz.
+# Fix the displayed value without changing CPU scheduling or real clocks.
+max_khz = 4320000
+
+[modules]
+sources = ["vendor_boot", "vendor_dlkm", "vendor", "system_dlkm"]
+load = []
+
+[touch]
+writes = []
+
+[partitions]
+# /metadata is mounted by the recovery's own qcom init instead of here: a
+# failure to mount it must not stop the recovery, and init only logs one.
+mounted = []
+
+# The phone's own SD card: a recovery's table names no card, so the recovery
+# finds the one the kernel reports and mounts it here. The file manager
+# reaches it from "/" as /external_sd.
+[sd]
+mount = "/external_sd"
+wait_seconds = 8
+
+[backup]
+efs = ["modemst1", "modemst2", "fsg", "fsc", "persist"]
+data_skipped = []
+
+[wipe]
+logs = []

@@ -1,0 +1,162 @@
+# Copyright (c) 2017-2018,2020-2021 The Linux Foundation. All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#     * Redistributions of source code must retain the above copyright
+#       notice, this list of conditions and the following disclaimer.
+#     * Redistributions in binary form must reproduce the above copyright
+#       notice, this list of conditions and the following disclaimer in the
+#       documentation and/or other materials provided with the distribution.
+#     * Neither the name of The Linux Foundation nor
+#       the names of its contributors may be used to endorse or promote
+#       products derived from this software without specific prior written
+#       permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NON-INFRINGEMENT ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+# CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+# EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+# PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+# OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+# WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+# OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+# ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+
+on early-fs
+    write /proc/sys/walt/sched_lib_name "recovery,Updater,updater,update_engine_sideload"
+    write /proc/sys/walt/sched_lib_mask_force 255
+
+service post-boot-script /system/bin/sh -c /vendor/bin/init.kernel.post_boot-sun_default_6_2.sh
+    user root
+    group root
+    oneshot
+    seclabel u:r:recovery:s0
+
+on init
+    setprop sys.usb.configfs 1
+    setprop prepdecrypt.setpatch true
+    start vendor.boot-qti
+    # CRYPTO_ORDER_FIX: 删掉这里的 start vendor.gatekeeper_default
+    # 原来在 keymint 之前启动，gatekeeper 连不上 HAL；改为 keymint 起来之后再起
+
+on property:ro.boot.usbcontroller=*
+    setprop sys.usb.controller ${ro.boot.usbcontroller}
+    wait /sys/bus/platform/devices/${ro.boot.usb.dwc3_msm:-a600000.ssusb}/mode
+    write /sys/bus/platform/devices/${ro.boot.usb.dwc3_msm:-a600000.ssusb}/mode peripheral
+    wait /sys/class/udc/${ro.boot.usbcontroller} 1
+
+on fs
+    wait /dev/block/platform/soc/${ro.boot.bootdevice}
+    symlink /dev/block/platform/soc/${ro.boot.bootdevice} /dev/block/bootdevice
+    write /proc/sys/kernel/firmware_config/force_sysfs_fallback 1
+
+    # CRYPTO_ORDER_FIX: TEE 通道权限。qseecomd 在 on init 已经起了，
+    # 但没这两行的话 keymint TA 走 smcinvoke 会 permission denied。
+    chmod 0660 /dev/qseecom
+    chown system drmrpc /dev/qseecom
+    chmod 0660 /dev/smcinvoke
+    chown system drmrpc /dev/smcinvoke
+
+    # CRYPTO_ORDER_FIX: TWRP 专有的 keyring 初始化，FBE 解密必须
+    install_keyring
+
+    # CRYPTO_ORDER_FIX: keymint 要向 servicemanager 注册，必须先有它
+    start servicemanager
+
+on boot
+    # Keep the cable: with the screen off nothing else holds the USB
+    # controller or the SoC awake, and the host loses the device.
+    write /sys/bus/platform/devices/a600000.dwc3/power/control on
+    write /sys/power/wake_lock skyward-recovery
+    # Mount firmware
+    mkdir /firmware
+    mount vfat /dev/block/bootdevice/by-name/modem${ro.boot.slot_suffix} /firmware ro
+    # Load ADSP firmware for PMIC
+    wait /sys/kernel/boot_adsp/ssr
+    write /sys/kernel/boot_adsp/ssr 1
+    wait /sys/class/power_supply/battery
+    start vendor.health-default
+    start override-spl
+    # --- SPU stack (stock ROM order) -------------------------------
+    # The stock vendor init mounts persist/spunvm and then runs
+    # sec_nvm + spdaemon before the Weaver HAL; do the same here so the
+    # SPU-backed weaver can serve /data CE decryption.
+    mkdir /mnt/vendor/persist 0711 system system
+    mkdir /mnt/vendor/persist/secnvm 0770 system system
+    mkdir /mnt/vendor/persist/spudc 0770 system system
+    mkdir /mnt/vendor/persist/iar_db 0770 system system
+    mkdir /mnt/vendor/spunvm 0770 system system
+    mount ext4 /dev/block/bootdevice/by-name/persist /mnt/vendor/persist
+    mount vfat /dev/block/bootdevice/by-name/spunvm /mnt/vendor/spunvm
+    insmod /vendor/lib/modules/spss_utils.ko
+    insmod /vendor/lib/modules/spcom.ko
+    restorecon --recursive /vendor/bin
+    restorecon --recursive /vendor/lib64
+    restorecon --recursive /vendor/etc
+    start skyward_sec_nvm
+    start skyward_spdaemon
+    start skyward_weaver
+
+    # KeyMint waits for this property before registering.
+    setprop vendor.gatekeeper.is_security_level_spu 0
+    # CRYPTO_ORDER_FIX: 固件/ADSP/模块都就绪后，才启动 KeyMint
+    start vendor.keymint-qti
+
+on property:vendor.sys.listeners.registered=true
+    umount /vendor
+    symlink /firmware /vendor/firmware_mnt
+    setprop sys.boot_completed 1
+    start vendor.ssgtzd
+
+    # CRYPTO_ORDER_FIX: TZ listener 注册完成后才算安全通道打通，此时再起 gatekeeper
+    start vendor.gatekeeper_default
+
+# FORCE_ADB_PATCH: 强制 adb，不等 GUI、不受设置影响。
+# 目的：UI 卡死时仍能 adb shell 进去抓日志/取证。
+on early-init
+    setprop service.adb.root 1
+    setprop ro.adb.secure 0
+    setprop persist.sys.usb.config adb
+    setprop sys.usb.config adb
+
+on fs
+    start adbd
+
+on boot
+    setprop sys.usb.config adb
+    start adbd
+
+
+# 每 10 秒把 recovery.log 拷一份到 /tmp/last.log，崩溃/卡死后再拿
+service logcopy /system/bin/sh -c 'while true; do cp -f /tmp/recovery.log /tmp/last.log 2>/dev/null; sleep 10; done'
+    user root
+    group root
+    seclabel u:r:recovery:s0
+    oneshot
+    disabled
+
+on boot
+    start logcopy
+
+# The SPU daemons run as root: started as `system` they exit 127 at once
+# and the SPU never comes up, so the weaver cannot read its config.
+service skyward_sec_nvm /vendor/bin/sec_nvm
+    class core
+    user root
+    group root system
+    seclabel u:r:recovery:s0
+
+service skyward_spdaemon /vendor/bin/spdaemon
+    class core
+    user root
+    group root system
+    seclabel u:r:recovery:s0
+
+service skyward_weaver /vendor/bin/hw/android.hardware.weaver-service-spu-qti
+    class hal
+    user root
+    group root system drmrpc
+    seclabel u:r:recovery:s0

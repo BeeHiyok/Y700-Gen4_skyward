@@ -1,0 +1,792 @@
+diff --git a/crates/skyward-binder/src/parcel.rs b/crates/skyward-binder/src/parcel.rs
+index c23605b..5708b8d 100644
+--- a/crates/skyward-binder/src/parcel.rs
++++ b/crates/skyward-binder/src/parcel.rs
+@@ -1,9 +1,12 @@
+ use anyhow::{bail, Context, Result};
+ 
+ /// The mark libbinder writes into every call header. Both ends have to agree
+-/// on it: it tells apart the copies of libbinder a phone carries, and the one
+-/// the recovery's own programs are built from is the recovery copy.
+-const HEADER: i32 = i32::from_be_bytes(*b"RECO");
++/// on it: it tells apart the copies of libbinder a phone carries. Stock
++/// recovery builds label their libbinder "RECO"; system/TWRP-derived
++/// recovery ramdisks label theirs "SYST". TB322FC's bootable Android 16
++/// ramdisk uses servicemanager/libbinder from the latter, which rejects
++/// "RECO" with `Parcel: Expecting header 0x53595354`.
++const HEADER: i32 = i32::from_be_bytes(*b"SYST");
+ 
+ /// Strict mode gathers violations rather than acting on them; a caller with
+ /// no policy of its own still sets that bit.
+@@ -236,7 +239,7 @@ mod tests {
+         let mut r = Reader::new(p.bytes());
+         assert_eq!(r.i32().unwrap(), i32::MIN, "strict mode gathers");
+         assert_eq!(r.i32().unwrap(), -1, "no work source");
+-        assert_eq!(r.i32().unwrap(), 0x5245_434f, "the recovery's mark, RECO");
++        assert_eq!(r.i32().unwrap(), 0x5359_5354, "the system libbinder's mark, SYST");
+         assert_eq!(r.string().unwrap(), "a.b.IC");
+         assert_eq!(r.here(), p.bytes().len(), "the header is all of it");
+     }
+diff --git a/crates/skyward-block/src/fstab.rs b/crates/skyward-block/src/fstab.rs
+index f75cbad..11343b4 100644
+--- a/crates/skyward-block/src/fstab.rs
++++ b/crates/skyward-block/src/fstab.rs
+@@ -5,7 +5,14 @@ use anyhow::{Context, Result};
+ use std::path::{Path, PathBuf};
+ 
+ /// Where the phone's own partitions keep the table.
+-pub const FILES: [&str; 2] = ["/vendor/etc/fstab.qcom", "/odm/etc/fstab.qcom"];
++///
++/// A phone booted through vendor_boot keeps its table in that ramdisk, at
++/// /vendor/etc/fstab.qcom, and a recovery does not mount it. The recovery's
++/// own table describes the same partitions, with the same encryption
++/// parameters, so it is read as well: without it a recovery cannot say how
++/// the data partition is encrypted at all.
++pub const FILES: [&str; 4] =
++    ["/vendor/etc/fstab.qcom", "/odm/etc/fstab.qcom", "/system/etc/recovery.fstab", "/etc/recovery.fstab"];
+ 
+ /// One filesystem the phone knows about.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+diff --git a/crates/skyward-config/src/lib.rs b/crates/skyward-config/src/lib.rs
+index 441ee4e..5f4ce00 100644
+--- a/crates/skyward-config/src/lib.rs
++++ b/crates/skyward-config/src/lib.rs
+@@ -46,6 +46,10 @@ pub struct DeviceConfig {
+     pub device: Device,
+     #[serde(default)]
+     pub display: Display,
++    /// Optional display-only CPU facts for devices whose cpufreq sysfs is
++    /// read inconsistently during recovery boot.
++    #[serde(default)]
++    pub cpu: CpuConfig,
+     #[serde(default)]
+     pub modules: Modules,
+     #[serde(default)]
+@@ -77,6 +81,10 @@ pub struct DeviceConfig {
+     /// The phone's WLAN, on phones whose driver the recovery brings up.
+     #[serde(default)]
+     pub wlan: Option<Wlan>,
++    /// The phone's own SD card, where it has one: the recovery mounts it
++    /// itself, since a recovery's table names no card.
++    #[serde(default)]
++    pub sd: Option<Sd>,
+     /// Where the phone maker answers which system is the newest, on phones
+     /// whose server the recovery knows.
+     #[serde(default)]
+@@ -99,6 +107,31 @@ pub struct Stock {
+     pub recovery: String,
+ }
+ 
++/// Optional override of the CPU facts the About/Specs pages show. A value of
++/// `None` keeps the reading from sysfs; `Some` fixes devices whose cpufreq
++/// nodes are transient during early recovery boot.
++#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
++pub struct CpuConfig {
++    #[serde(default)]
++    pub max_khz: Option<u32>,
++}
++
++/// The phone's own SD card. A recovery's table names no card, so the
++/// recovery finds the one the kernel reports and mounts it itself.
++#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
++pub struct Sd {
++    /// Where the card is shown, such as /external_sd.
++    pub mount: String,
++    /// How long to wait for a card the slot has not reported yet, in
++    /// seconds; the slot is polled and a card can take a moment to appear.
++    #[serde(default = "sd_wait_seconds")]
++    pub wait_seconds: u64,
++}
++
++fn sd_wait_seconds() -> u64 {
++    8
++}
++
+ /// What brings the phone's WLAN up inside a recovery, which loads none of
+ /// it: the driver, what it reads as it starts, and the phone's own
+ /// wpa_supplicant, which joins networks.
+@@ -212,8 +245,14 @@ pub struct Haptics {
+     #[serde(default)]
+     pub click: Option<i16>,
+     /// The file the driver says the motor's resonant frequency in, in
+-    /// tenths of a hertz whatever its label.
+-    pub resonance: String,
++    /// tenths of a hertz whatever its label. Devices whose driver exports
++    /// no such file use `resonance_hz` instead.
++    #[serde(default)]
++    pub resonance: Option<String>,
++    /// Motor resonant frequency in hertz, for drivers that do not export a
++    /// sysfs frequency file. Mutually exclusive with `resonance`.
++    #[serde(default)]
++    pub resonance_hz: Option<f32>,
+     pub strength: Strength,
+ }
+ 
+@@ -544,8 +583,16 @@ impl DeviceConfig {
+             ensure!(plain && !folder.is_empty(), "[backup] data_skipped: {folder} is not a path from the top of {DATA}");
+         }
+         if let Some(haptics) = &cfg.haptics {
+-            let file = &haptics.resonance;
+-            ensure!(Path::new(file).is_absolute(), "[haptics] resonance: {file} is not an absolute path");
++            match (&haptics.resonance, haptics.resonance_hz) {
++                (Some(file), None) => {
++                    ensure!(Path::new(file).is_absolute(), "[haptics] resonance: {file} is not an absolute path");
++                }
++                (None, Some(hz)) => {
++                    ensure!(hz.is_finite() && hz > 0.0, "[haptics] resonance_hz: {hz} is not a positive frequency");
++                }
++                (Some(_), Some(_)) => ensure!(false, "[haptics] names both resonance and resonance_hz"),
++                (None, None) => ensure!(false, "[haptics] names no resonance or resonance_hz"),
++            }
+             let Strength { lightest, strongest } = haptics.strength;
+             ensure!(
+                 0.0 < lightest && lightest < strongest && strongest <= 1.0,
+@@ -585,6 +632,12 @@ impl DeviceConfig {
+                 stock.recovery
+             );
+         }
++        if let Some(sd) = &cfg.sd {
++            let at = Path::new(&sd.mount);
++            let plain = at.components().all(|c| matches!(c, std::path::Component::Normal(_) | std::path::Component::RootDir));
++            ensure!(at.is_absolute() && plain && sd.mount != "/", "[sd] mount: {} is not an absolute path to a folder", sd.mount);
++            ensure!(sd.wait_seconds <= 120, "[sd] wait_seconds: {} is longer than two minutes", sd.wait_seconds);
++        }
+         if let Some(wlan) = &cfg.wlan {
+             ensure!(wlan.probe.starts_with("http://"), "[wlan] probe: {} is not a plain HTTP address", wlan.probe);
+             for file in &wlan.firmware {
+@@ -646,7 +699,7 @@ mod tests {
+     fn ishtar_clicks_with_a_waveform_its_driver_keeps() {
+         let cfg = DeviceConfig::parse(include_str!("../../../devices/ishtar.toml")).unwrap();
+         let haptics = cfg.haptics.expect("the 13 Ultra has a motor");
+-        assert_eq!((haptics.click, haptics.resonance.as_str()), (Some(0), "/sys/class/qcom-haptics/lra_frequency_hz"));
++        assert_eq!((haptics.click, haptics.resonance.as_deref()), (Some(0), Some("/sys/class/qcom-haptics/lra_frequency_hz")));
+         assert_eq!(haptics.strength, Strength { lightest: 0.5, strongest: 1.0 });
+     }
+ 
+@@ -739,7 +792,7 @@ mod tests {
+         assert_eq!(weaver.ready_service.as_deref(), Some("android.hardware.weaver.IWeaver/default"));
+         assert_eq!(boot.ready_service.as_deref(), Some("android.hardware.boot.IBootControl/default"));
+         let haptics = cfg.haptics.expect("the 17 Ultra has a motor");
+-        assert_eq!((haptics.click, haptics.resonance.as_str()), (None, "/sys/class/qcom-haptics/lra_frequency_hz"), "its click is made");
++        assert_eq!((haptics.click, haptics.resonance.as_deref()), (None, Some("/sys/class/qcom-haptics/lra_frequency_hz")), "its click is made");
+         assert_eq!(haptics.strength, Strength { lightest: 0.25, strongest: 0.75 }, "past three quarters the motor rattles");
+         assert_eq!(cfg.backup.efs, ["modemst1", "modemst2", "fsg", "fsc", "persist"]);
+         assert!(cfg.backup.data_skipped.contains(&"vendor/goodix".to_string()));
+diff --git a/crates/skyward-info/src/lib.rs b/crates/skyward-info/src/lib.rs
+index 3e53f7f..06650fa 100644
+--- a/crates/skyward-info/src/lib.rs
++++ b/crates/skyward-info/src/lib.rs
+@@ -148,7 +148,13 @@ pub fn collect(cfg: &DeviceConfig) -> Result<DeviceInfo> {
+         model: system.get("ro.product.marketname").unwrap_or_else(|| cfg.device.model.clone()),
+         codename: cfg.device.codename.clone(),
+         soc: cfg.device.soc.clone(),
+-        cpu: cpu(Path::new(CPU))?,
++        cpu: {
++            let mut c = cpu(Path::new(CPU))?;
++            if let Some(khz) = cfg.cpu.max_khz {
++                c.max_khz = Some(khz);
++            }
++            c
++        },
+         ram_kib: mem_total(&read("/proc/meminfo")?)?,
+         panel: (d.width > 0 && d.height > 0).then_some((d.width, d.height)),
+         screen: d.diagonal,
+diff --git a/crates/skyward-modules/src/lib.rs b/crates/skyward-modules/src/lib.rs
+index ec33ac9..69cfb53 100644
+--- a/crates/skyward-modules/src/lib.rs
++++ b/crates/skyward-modules/src/lib.rs
+@@ -10,13 +10,19 @@ pub mod modprobe;
+ /// partitions where they are mounted, and the kernel's own modules in
+ /// system_dlkm, which it also keeps in one folder.
+ pub fn source_dir(source: &str) -> Result<PathBuf> {
+-    Ok(PathBuf::from(match source {
+-        "vendor_boot" => "/lib/modules",
+-        "vendor_dlkm" => "/vendor_dlkm/lib/modules",
+-        "vendor" => "/vendor/lib/modules",
+-        "system_dlkm" => "/system_dlkm/flatten/lib/modules",
++    match source {
++        "vendor_boot" => Ok(PathBuf::from("/lib/modules")),
++        "vendor_dlkm" => Ok(PathBuf::from("/vendor_dlkm/lib/modules")),
++        "vendor" => Ok(PathBuf::from("/vendor/lib/modules")),
++        // Some GKI layouts flatten the kernel modules; Lenovo TB322FC keeps
++        // rfkill directly in /system_dlkm/lib/modules.
++        "system_dlkm" => {
++            let flattened = PathBuf::from("/system_dlkm/flatten/lib/modules");
++            let direct = PathBuf::from("/system_dlkm/lib/modules");
++            if flattened.is_dir() { Ok(flattened) } else { Ok(direct) }
++        }
+         _ => bail!("unknown module source {source:?}"),
+-    }))
++    }
+ }
+ 
+ /// Load `names` (module names without `.ko`) with their dependencies. Each
+@@ -33,9 +39,16 @@ pub fn load(dirs: &[PathBuf], names: &[String]) -> Result<Vec<PathBuf>> {
+             .ok_or_else(|| anyhow!("{file} is in none of {dirs:?}"))?;
+         let graph = parse_dep(dir)?;
+         for m in graph.load_order(std::slice::from_ref(&file)) {
+-            let path = graph
+-                .resolve_path(&m)
+-                .ok_or_else(|| anyhow!("{m} is listed in {}/modules.dep but missing", dir.display()))?;
++            // Dependencies may live in a different module source than the
++            // requested module. GKI devices keep rfkill in system_dlkm and
++            // cfg80211/qca_cld3 in vendor; resolve every file across all
++            // configured sources rather than only the graph's base.
++            let path = dirs
++                .iter()
++                .map(|d| d.join(&m))
++                .find(|p| p.is_file())
++                .or_else(|| dirs.iter().find_map(|d| find_file(d, &m)))
++                .ok_or_else(|| anyhow!("{m} is listed in {}/modules.dep but missing from {dirs:?}", dir.display()))?;
+             insmod(&path, "")?;
+             loaded.push(path);
+         }
+diff --git a/crates/skyward-sys/src/lib.rs b/crates/skyward-sys/src/lib.rs
+index fc11ddf..c242ad9 100644
+--- a/crates/skyward-sys/src/lib.rs
++++ b/crates/skyward-sys/src/lib.rs
+@@ -157,7 +157,54 @@ impl Power {
+ }
+ 
+ pub fn power(target: Power) -> Result<()> {
+-    set_prop("sys.powerctl", target.command())
++    // Some recovery init implementations ignore sys.powerctl. Fall back to a
++    // direct kernel reboot after syncing; for recovery/fastboot also leave the
++    // matching bootloader control block so the bootloader selects the target.
++    let requested = set_prop("sys.powerctl", target.command());
++    sync_all();
++    #[cfg(target_os = "android")]
++    {
++        match target {
++            Power::Recovery => {
++                let misc = bcb::misc();
++                let _ = bcb::write(&misc, &bcb::Bcb { command: "boot-recovery".into(), args: Vec::new() });
++            }
++            Power::Fastboot => {
++                let misc = bcb::misc();
++                let _ = bcb::write(&misc, &bcb::Bcb { command: "boot-fastboot".into(), args: Vec::new() });
++            }
++            Power::System => {
++                let misc = bcb::misc();
++                let _ = bcb::clear(&misc);
++            }
++            Power::Bootloader | Power::Edl | Power::Off => {}
++        }
++        // Linux reboot(2) constants. Use the raw syscall rather than a
++        // bionic wrapper so this works across NDK/libc crate versions.
++        const SYS_REBOOT_AARCH64: libc::c_long = 142;
++        const LINUX_REBOOT_MAGIC1: libc::c_ulong = 0xfee1_dead;
++        const LINUX_REBOOT_MAGIC2A: libc::c_ulong = 672_274_793;
++        const LINUX_REBOOT_CMD_RESTART: libc::c_ulong = 0x0123_4567;
++        const LINUX_REBOOT_CMD_POWER_OFF: libc::c_ulong = 0x4321_fedc;
++        let cmd = match target {
++            Power::Off => LINUX_REBOOT_CMD_POWER_OFF,
++            _ => LINUX_REBOOT_CMD_RESTART,
++        };
++        // reboot(2) never returns on success. If it fails, preserve the
++        // original property-service error for the caller.
++        let rc = unsafe { libc::syscall(SYS_REBOOT_AARCH64, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2A, cmd, 0usize) };
++        let _ = rc;
++    }
++    requested
++}
++
++/// Flush filesystem data before a direct reboot, as init would before it
++/// acted on sys.powerctl.
++fn sync_all() {
++    #[cfg(target_os = "android")]
++    unsafe {
++        libc::sync();
++    }
+ }
+ 
+ /// The folder the recovery service keeps what it makes for itself in, for
+diff --git a/crates/skyward-ui/src/surface.rs b/crates/skyward-ui/src/surface.rs
+index ab27c29..3139a6a 100644
+--- a/crates/skyward-ui/src/surface.rs
++++ b/crates/skyward-ui/src/surface.rs
+@@ -773,33 +773,27 @@ pub mod kms {
+         /// Where the display driver has no low-power mode, the display
+         /// turns off. A touch controller that follows the panel, as
+         /// Xiaomi's do, rests with it either way.
++        /// Keep the DRM pipeline on while the UI is "asleep". On Lenovo
++        /// TB322FC, changing the panel low-power property or deactivating the
++        /// CRTC drops the USB gadget and makes the recovery black-screen
++        /// loop. The caller already blanks the framebuffer and turns the
++        /// backlight down to zero, so keeping Power::On is visually dark but
++        /// leaves KMS and USB stable.
+         pub fn rest(&mut self) -> Result<()> {
+-            if self.power != Power::On {
+-                return Ok(());
++            // The screen is already visually dark: the caller blanks the
++            // framebuffer and drives the backlight to its minimum. Touching
++            // the DRM connector DPMS here is not needed and is harmful on
++            // TB322FC: a connector-only commit is rejected with EINVAL, and a
++            // commit that does take effect powers the panel down in a way that
++            // takes the USB gadget with it.
++            if self.power == Power::On {
++                self.power = Power::Resting;
+             }
+-            let Some((id, _, rest)) = self.lp else { return self.turn_off() };
+-            self.settle()?;
+-            let mut req = atomic::AtomicModeReq::new();
+-            req.add_property(self.conn, id, property::Value::UnsignedRange(rest));
+-            self.card.atomic_commit(AtomicCommitFlags::empty(), req).context("rest the panel")?;
+-            self.power = Power::Resting;
+             Ok(())
+         }
+ 
+-        /// Turn the display off: the panel and the display processor feeding
+-        /// it stop drawing power. The next frame presented turns it on
+-        /// again.
++        /// See [`KmsSurface::rest`]: keep the CRTC and connector alone.
+         pub fn turn_off(&mut self) -> Result<()> {
+-            if self.power == Power::Off {
+-                return Ok(());
+-            }
+-            self.settle()?;
+-            let mut req = atomic::AtomicModeReq::new();
+-            req.add_property(self.crtc, self.active, property::Value::Boolean(false));
+-            // Qualcomm's display driver sends no event for a commit that
+-            // turns its CRTC off, so this one is made to return once it is
+-            // done.
+-            self.card.atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req).context("turn the display off")?;
+             self.power = Power::Off;
+             Ok(())
+         }
+@@ -876,31 +870,20 @@ pub mod kms {
+                     }
+                 }
+             }
+-            let mut req = atomic::AtomicModeReq::new();
+-            for &(plane, fb_prop) in &self.planes {
+-                req.add_property(plane, fb_prop, property::Value::Framebuffer(Some(buf.fb)));
+-            }
+-            let mut flags = AtomicCommitFlags::NONBLOCK | AtomicCommitFlags::PAGE_FLIP_EVENT;
+-            if self.power != Power::On {
+-                // The panel runs again, and coming on from off it would
+-                // otherwise rest again as it last did.
+-                if let Some((id, run, _)) = self.lp {
+-                    req.add_property(self.conn, id, property::Value::UnsignedRange(run));
+-                }
+-            }
+-            if self.power == Power::Off {
+-                req.add_property(self.crtc, self.active, property::Value::Boolean(true));
+-                req.add_property(self.crtc, self.mode_id, self.preferred);
+-                if let Some((id, setup)) = self.spr {
+-                    req.add_property(self.crtc, id, setup);
+-                }
+-                flags |= AtomicCommitFlags::ALLOW_MODESET;
+-            }
++            // Copy the values needed after settle() so no immutable borrow of
++            // self survives the mutable borrow in settle().
++            let fb = buf.fb;
++            let planes: Vec<_> = self.planes.clone();
+             self.settle()?;
+-            self.card.atomic_commit(flags, req).context(if self.power == Power::On { "flip" } else { "turn the display on" })?;
+-            if self.power == Power::Off {
+-                self.slow = self.fastest.is_some();
++
++            // The connector is never taken out of DPMS On, so waking needs no
++            // property change: the plain flip below is the whole of it.
++            let mut req = atomic::AtomicModeReq::new();
++            for &(plane, fb_prop) in &planes {
++                req.add_property(plane, fb_prop, property::Value::Framebuffer(Some(fb)));
+             }
++            let flags = AtomicCommitFlags::NONBLOCK | AtomicCommitFlags::PAGE_FLIP_EVENT;
++            self.card.atomic_commit(flags, req).context("flip")?;
+             self.power = Power::On;
+             self.flipping = true;
+             self.back = (self.back + 1) % self.bufs.len();
+diff --git a/crates/skyward-vab/src/partitions.rs b/crates/skyward-vab/src/partitions.rs
+index 57bc34c..925bf1a 100644
+--- a/crates/skyward-vab/src/partitions.rs
++++ b/crates/skyward-vab/src/partitions.rs
+@@ -114,7 +114,14 @@ fn ensure_no_snapshot() -> Result<()> {
+ pub fn mount_partitions(slot: Slot) -> Result<Mounts> {
+     let metadata = Path::new(METADATA);
+     if !mount::is_mount_point(metadata)? {
+-        mount::mount_ro(&Path::new(BY_NAME).join("metadata"), metadata)?;
++        // A recovery's own init may be mounting it at the same moment, which
++        // makes this one fail with EBUSY. That is not a reason to stop: what
++        // matters is that it ends up mounted.
++        if let Err(e) = mount::mount_ro(&Path::new(BY_NAME).join("metadata"), metadata) {
++            if !mount::is_mount_point(metadata)? {
++                return Err(e);
++            }
++        }
+     }
+     let super_dev = super_device();
+     let md = skyward_lp::read(&super_dev, slot.number())?;
+diff --git a/crates/skyward/src/haptics.rs b/crates/skyward/src/haptics.rs
+index c36d1c7..1e1dcab 100644
+--- a/crates/skyward/src/haptics.rs
++++ b/crates/skyward/src/haptics.rs
+@@ -85,7 +85,12 @@ impl Haptics {
+     /// only as it is played.
+     pub fn open(cfg: &skyward_config::Haptics) -> Result<Haptics> {
+         let (path, dev) = motor()?;
+-        let hz = resonance(&cfg.resonance)?;
++        let hz = match (&cfg.resonance, cfg.resonance_hz) {
++            (Some(file), None) => resonance(file)?,
++            (None, Some(hz)) => hz,
++            (Some(_), Some(_)) => return Err(anyhow!("[haptics] names both resonance and resonance_hz")),
++            (None, None) => return Err(anyhow!("[haptics] names no resonance or resonance_hz")),
++        };
+         let click = match cfg.click {
+             Some(id) => {
+                 eprintln!("haptics {}: clicks with waveform {id}, ticks made for a motor swinging at {hz} Hz", path.display());
+diff --git a/crates/skyward/src/main.rs b/crates/skyward/src/main.rs
+index 1a4c1f0..ac399d8 100644
+--- a/crates/skyward/src/main.rs
++++ b/crates/skyward/src/main.rs
+@@ -25,6 +25,7 @@ mod pty;
+ mod readings;
+ #[cfg(target_os = "android")]
+ mod relabel;
++mod sd;
+ #[cfg(target_os = "android")]
+ mod secure;
+ #[cfg(target_os = "android")]
+@@ -510,6 +511,11 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<()> {
+         let at = skyward_block::fstab::mount(name)?;
+         skyward_sys::kmsg(&format!("{name} is mounted on {}", at.display()))?;
+     }
++    if let Some(sd) = &cfg.sd {
++        if let Err(e) = sd::mount(sd) {
++            skyward_sys::kmsg(&format!("the SD card is not mounted: {e:#}"))?;
++        }
++    }
+     for path in load_modules(cfg, &cfg.modules.load)? {
+         skyward_sys::kmsg(&format!("loaded {}", path.display()))?;
+     }
+@@ -674,8 +680,30 @@ fn adopt_installed_version(props: &std::collections::HashMap<String, String>) ->
+ /// goes on stays in misc until the work is done; any other is cleared at
+ /// once, so that any reboot from here boots the system. Failures go to the
+ /// kernel log and still end the process, which init then starts again.
++/// Keep the cable: with the screen off nothing else holds the USB controller
++/// or the SoC awake, and the host loses the device after a while. The
++/// controller's own runtime power management is turned off and a wake lock
++/// is held for as long as the recovery runs. The address is found rather
++/// than named, since it differs from phone to phone, and the write repeats:
++/// the controller is registered some time after the recovery starts, and
++/// switching the port's function resets the setting.
++fn keep_the_cable() {
++    std::thread::spawn(|| loop {
++        if let Ok(entries) = std::fs::read_dir("/sys/bus/platform/devices") {
++            for entry in entries.flatten() {
++                if entry.file_name().to_string_lossy().ends_with(".dwc3") {
++                    let _ = std::fs::write(entry.path().join("power/control"), "on");
++                }
++            }
++        }
++        let _ = std::fs::write("/sys/power/wake_lock", "skyward-recovery");
++        std::thread::sleep(std::time::Duration::from_secs(2));
++    });
++}
++
+ fn recovery() -> Result<()> {
+     use std::os::unix::fs::PermissionsExt;
++    keep_the_cable();
+     let run = || -> Result<()> {
+         // Open to the programs the recovery runs as other users, the
+         // supplicant among them, whatever the umask.
+diff --git a/crates/skyward/src/sd.rs b/crates/skyward/src/sd.rs
+new file mode 100644
+index 0000000..0125fb1
+--- /dev/null
++++ b/crates/skyward/src/sd.rs
+@@ -0,0 +1,98 @@
++//! The phone's own SD card: a recovery's table names no card, so the one
++//! the kernel reports is found here and mounted where the device's
++//! configuration says it should be shown.
++
++use anyhow::{bail, Context, Result};
++use skyward_config::Sd;
++use std::path::{Path, PathBuf};
++use std::time::{Duration, Instant};
++
++/// The filesystems a card may hold, the two the cards of phones are
++/// formatted as first. The kernel is asked for each in turn and only its
++/// answer for "not this filesystem" moves on to the next.
++const FILESYSTEMS: [&str; 4] = ["vfat", "exfat", "ext4", "f2fs"];
++
++/// The block devices of the cards the kernel reports, partitions first: a
++/// card holding one partition is mounted through that partition, and a card
++/// formatted whole is mounted through the device itself.
++fn cards() -> Result<Vec<PathBuf>> {
++    let mut partitions = Vec::new();
++    let mut disks = Vec::new();
++    let listing = match std::fs::read_dir("/sys/class/block") {
++        Ok(listing) => listing,
++        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
++        Err(e) => return Err(e).context("read /sys/class/block"),
++    };
++    for entry in listing {
++        let entry = entry.context("read /sys/class/block")?;
++        let name = entry.file_name();
++        let Some(name) = name.to_str() else { continue };
++        // The card reader's own boot and replay-protected areas are not the
++        // card: mmcblk0boot0, mmcblk0boot1, mmcblk0rpmb.
++        if !name.starts_with("mmcblk") || name.contains("boot") || name.contains("rpmb") {
++            continue;
++        }
++        let at = entry.path();
++        let device = Path::new("/dev/block").join(name);
++        if at.join("partition").exists() {
++            partitions.push(device);
++        } else {
++            disks.push(device);
++        }
++    }
++    partitions.sort();
++    disks.sort();
++    partitions.extend(disks);
++    Ok(partitions)
++}
++
++/// Mount `card` at `at` with the first filesystem that takes it, writable
++/// where the kernel allows it and read-only otherwise.
++fn mount_one(card: &Path, at: &Path) -> Result<&'static str> {
++    let mut refused = Vec::new();
++    for options in [Vec::new(), vec!["ro".to_string()]] {
++        for filesystem in FILESYSTEMS {
++            match skyward_block::mount::mount(card, at, filesystem, &options) {
++                Ok(()) => return Ok(filesystem),
++                Err(e) => refused.push(format!("{filesystem}: {e}")),
++            }
++        }
++    }
++    bail!("{}", refused.join("; "))
++}
++
++/// Mount the phone's SD card where the configuration says it is shown, and
++/// say in the kernel log what was found. A phone with no card is not an
++/// error: the recovery works without one.
++pub fn mount(cfg: &Sd) -> Result<()> {
++    let at = Path::new(&cfg.mount);
++    if skyward_block::mount::is_mount_point(at)? {
++        return Ok(());
++    }
++    let until = Instant::now() + Duration::from_secs(cfg.wait_seconds.clamp(1, 120));
++    loop {
++        let found = cards()?;
++        for card in &found {
++            std::fs::create_dir_all(at).with_context(|| format!("make {}", at.display()))?;
++            match mount_one(card, at) {
++                Ok(filesystem) => {
++                    skyward_sys::kmsg(&format!(
++                        "the SD card {} is mounted on {} as {filesystem}",
++                        card.display(),
++                        at.display()
++                    ))?;
++                    return Ok(());
++                }
++                Err(e) => {
++                    skyward_sys::kmsg(&format!("{} cannot be mounted as a card: {e}", card.display()))?;
++                }
++            }
++        }
++        if Instant::now() >= until {
++            break;
++        }
++        std::thread::sleep(Duration::from_millis(200));
++    }
++    skyward_sys::kmsg(&format!("no SD card was found to mount on {}", at.display()))?;
++    Ok(())
++}
+diff --git a/crates/skyward/src/ui.rs b/crates/skyward/src/ui.rs
+index 3144b83..2e94b38 100644
+--- a/crates/skyward/src/ui.rs
++++ b/crates/skyward/src/ui.rs
+@@ -112,13 +112,30 @@ impl Backlight {
+         };
+         let top = normal_max(read("max_brightness")?)?;
+         let level = read("brightness")?;
++        // A previous run, or the stock system, may have left the panel in
++        // FB_BLANK_POWERDOWN. msm_drm's update_status ignores every brightness
++        // write while bl_power is not FB_BLANK_UNBLANK, so clear it once here
++        // to make the panel writable.
++        let power = dir.join("bl_power");
++        if power.is_file() && fs::read_to_string(&power).map(|t| t.trim() != "0").unwrap_or(false) {
++            fs::write(&power, "0").with_context(|| format!("write {}", power.display()))?;
++        }
+         Ok(Backlight { path: dir.join("brightness"), top, level })
+     }
+ 
+     /// Light the panel at `level` of its normal maximum, or turn it off
+     /// with `None`. The file is written only when the raw level changes.
+     fn show(&mut self, level: Option<f32>) -> Result<()> {
+-        let raw = level.map_or(0, |v| ((v.clamp(0.0, 1.0) * self.top as f32).round() as u32).max(1));
++        // msm_drm's sde_backlight_device_update_status drops brightness 0
++        // entirely, so the panel's aw99706a controller keeps whatever level it
++        // was last given: the dim step of the fade, about 5% of the maximum,
++        // which still glows. The smallest level the controller accepts is 1 of
++        // 4095, which is visually black, so that is the off level here.
++        //
++        // It also ignores every write while bl_power is not FB_BLANK_UNBLANK,
++        // so bl_power is never set to power-down: doing that both fails to turn
++        // the panel off and blocks the brightness write that would.
++        let raw = level.map_or(1, |v| ((v.clamp(0.0, 1.0) * self.top as f32).round() as u32).max(1));
+         if raw != self.level {
+             fs::write(&self.path, raw.to_string()).with_context(|| format!("write {}", self.path.display()))?;
+             eprintln!("backlight {raw}");
+@@ -137,10 +154,13 @@ impl Backlight {
+ /// their factory tests drive the panel to, on the backlight's own scale:
+ /// the 13 Ultra's panels give that level as well, and it comes to the same
+ /// half of their range as the normal maximum they give.
+-const NORMAL_MAX: [(&str, &str); 3] = [
++const NORMAL_MAX: [(&str, &str); 4] = [
+     ("mi,normal-max-brightness-clone", "mi,max-brightness-clone"),
+     ("mi,max-brightness-normal", "qcom,mdss-dsi-bl-max-level"),
+     ("mi,mdss-dsi-fac-bl-max-level", "qcom,mdss-dsi-bl-max-level"),
++    // Non-Xiaomi Qualcomm panels, such as Lenovo TB322FC's elden panel,
++    // give the normal maximum directly on the backlight's own scale.
++    ("qcom,mdss-brightness-max-level", "qcom,mdss-dsi-bl-max-level"),
+ ];
+ 
+ /// The raw backlight level, out of `max`, at the panel's normal maximum.
+@@ -1446,12 +1466,23 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request,
+             if app.take_dirty() || !surface.is_on() {
+                 let t0 = Instant::now();
+                 app.compose(&mut screen, &fonts, &info, &shown_clock, now);
+-                surface.present(&screen)?;
+-                eprintln!("frame {:?} in {} ms", app.screen(), t0.elapsed().as_millis());
+-                if let Some(path) = dump {
+-                    fs::write(path, &screen.data).with_context(|| format!("write {}", path.display()))?;
++                // A failed flip must not end the recovery: init would restart
++                // it, which re-initialises the USB gadget (the host sees a
++                // disconnect) and lights the panel again. Log it and let the
++                // next frame try.
++                match surface.present(&screen) {
++                    Ok(()) => {
++                        eprintln!("frame {:?} in {} ms", app.screen(), t0.elapsed().as_millis());
++                        if let Some(path) = dump {
++                            fs::write(path, &screen.data).with_context(|| format!("write {}", path.display()))?;
++                        }
++                        shown = true;
++                    }
++                    Err(e) => {
++                        eprintln!("frame {:?} not shown: {e:#}", app.screen());
++                        std::thread::sleep(std::time::Duration::from_millis(50));
++                    }
+                 }
+-                shown = true;
+             }
+             blanked = false;
+         } else if !blanked {
+@@ -1459,31 +1490,50 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request,
+             // to 0 and the display off, so an OLED that floors the backlight
+             // above zero rather than cutting it shows nothing as it goes off.
+             screen.data.fill(0);
+-            surface.present(&screen)?;
+-            surface.settle()?;
++            if let Err(e) = surface.present(&screen) {
++                eprintln!("blank frame not shown: {e:#}");
++            }
++            if let Err(e) = surface.settle() {
++                eprintln!("blank settle failed: {e:#}");
++            }
+             blanked = true;
+         }
+         // After the frame is on the panel, so a panel coming back on lights
+         // with what it should show now, never with what it showed when it
+         // went off.
+         if backlight.level == 0 && panel.is_some() {
+-            surface.settle()?;
++            if let Err(e) = surface.settle() {
++                eprintln!("settle failed: {e:#}");
++            }
+         }
+-        backlight.show(panel)?;
++        let panel_level = if app.display_on() { panel } else { None };
++        backlight.show(panel_level)?;
+         if panel.is_some() {
+             // Lit, a panel that came on again switches to its fastest
+             // refresh.
+-            surface.speed_up()?;
++            if let Err(e) = surface.speed_up() {
++                eprintln!("speed up failed: {e:#}");
++            }
+             rested_at = None;
+         } else if surface.is_on() {
+             // With the backlight off, the panel rests, and the touch
+             // controller following it stops drawing power.
+-            surface.rest()?;
+-            rested_at = Some(Instant::now());
++            // A failed power-down must not end the recovery: init would
++            // restart it, re-initialising the USB gadget (the host sees a
++            // disconnect) and lighting the panel again.
++            match surface.rest() {
++                Ok(()) => rested_at = Some(Instant::now()),
++                Err(e) => {
++                    eprintln!("rest failed: {e:#}");
++                    rested_at = None;
++                }
++            }
+         } else if rested_at.is_some_and(|at| at.elapsed() >= REST) {
+             // Rested long enough, the display goes off: the panel and the
+             // display processor feeding it stop drawing power.
+-            surface.turn_off()?;
++            if let Err(e) = surface.turn_off() {
++                eprintln!("turn off failed: {e:#}");
++            }
+             rested_at = None;
+         }
+         // A page at rest draws the rows it has yet to while nothing else
+diff --git a/devices/TB322FC.toml b/devices/TB322FC.toml
+new file mode 100644
+index 0000000..0135d94
+--- /dev/null
++++ b/devices/TB322FC.toml
+@@ -0,0 +1,50 @@
++# Stable v3.1 baseline for Lenovo LEGION Y700 (4th Gen), TB322FC.
++# Intentionally contains no service chain, WLAN, haptics or decryption
++# experiments: those caused HAL restarts, black-screen loops and USB loss in
++# v4/v5. Add one feature at a time after verifying stability.
++
++[device]
++codename = "TB322FC"
++brand = "Lenovo"
++model = "联想拯救者Y700（第四代）"
++ab = true
++os_version_prop = "ro.build.display.id"
++soc = { hans = "骁龙®8至尊版移动平台", hant = "Snapdragon® 8 Elite 行動平台", en = "Snapdragon® 8 Elite Mobile Platform" }
++
++[display]
++width = 1904
++height = 3040
++density = 440
++diagonal = 8.8
++corner_radius = 55
++
++[cpu]
++# The UI showed 8.64GHz even though sysfs and `info` read 4320000 kHz.
++# Fix the displayed value without changing CPU scheduling or real clocks.
++max_khz = 4320000
++
++[modules]
++sources = ["vendor_boot", "vendor_dlkm", "vendor", "system_dlkm"]
++load = []
++
++[touch]
++writes = []
++
++[partitions]
++# /metadata is mounted by the recovery's own qcom init instead of here: a
++# failure to mount it must not stop the recovery, and init only logs one.
++mounted = []
++
++# The phone's own SD card: a recovery's table names no card, so the recovery
++# finds the one the kernel reports and mounts it here. The file manager
++# reaches it from "/" as /external_sd.
++[sd]
++mount = "/external_sd"
++wait_seconds = 8
++
++[backup]
++efs = ["modemst1", "modemst2", "fsg", "fsc", "persist"]
++data_skipped = []
++
++[wipe]
++logs = []
