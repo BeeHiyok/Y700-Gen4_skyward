@@ -146,6 +146,9 @@ export SKYWARD_SRC=$PWD/skyward
 
 完整的技术记录见 [`docs/HANDOFF.md`](docs/HANDOFF.md)，这里只列要点。
 
+> `docs/HANDOFF.md` 里的 `v3.x` 是移植过程中的内部修订号，和上游版本号无关；
+> 对外发布的版本一律对齐上游 **v0.2.0**。
+
 ### 1. 背光与熄屏
 
 `msm_drm` 的 `sde_backlight_device_update_status` 会**丢弃 `brightness=0`**，
