@@ -160,7 +160,15 @@ pub fn power(target: Power) -> Result<()> {
     // Some recovery init implementations ignore sys.powerctl. Fall back to a
     // direct kernel reboot after syncing; for recovery/fastboot also leave the
     // matching bootloader control block so the bootloader selects the target.
-    let requested = set_prop("sys.powerctl", target.command());
+    //
+    // The bootloader and EDL are asked for by the kernel's own restart with a
+    // string, and not through sys.powerctl: a recovery init that only looks at
+    // the "reboot," part of the value reboots into the system before this can
+    // run, which is exactly what a bootloader request must not do.
+    let requested = match target {
+        Power::Bootloader | Power::Edl => Ok(()),
+        _ => set_prop("sys.powerctl", target.command()),
+    };
     sync_all();
     #[cfg(target_os = "android")]
     {
@@ -186,13 +194,19 @@ pub fn power(target: Power) -> Result<()> {
         const LINUX_REBOOT_MAGIC2A: libc::c_ulong = 672_274_793;
         const LINUX_REBOOT_CMD_RESTART: libc::c_ulong = 0x0123_4567;
         const LINUX_REBOOT_CMD_POWER_OFF: libc::c_ulong = 0x4321_fedc;
-        let cmd = match target {
-            Power::Off => LINUX_REBOOT_CMD_POWER_OFF,
-            _ => LINUX_REBOOT_CMD_RESTART,
+        // RESTART2 carries a string to the bootloader, which is how Android
+        // itself asks for the bootloader: a plain restart would land in the
+        // system, since nothing in the boot chain would be asked otherwise.
+        const LINUX_REBOOT_CMD_RESTART2: libc::c_ulong = 0xa1b2_c3d4;
+        let (cmd, arg): (libc::c_ulong, usize) = match target {
+            Power::Off => (LINUX_REBOOT_CMD_POWER_OFF, 0),
+            Power::Bootloader => (LINUX_REBOOT_CMD_RESTART2, b"bootloader\0".as_ptr() as usize),
+            Power::Edl => (LINUX_REBOOT_CMD_RESTART2, b"edl\0".as_ptr() as usize),
+            _ => (LINUX_REBOOT_CMD_RESTART, 0),
         };
         // reboot(2) never returns on success. If it fails, preserve the
         // original property-service error for the caller.
-        let rc = unsafe { libc::syscall(SYS_REBOOT_AARCH64, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2A, cmd, 0usize) };
+        let rc = unsafe { libc::syscall(SYS_REBOOT_AARCH64, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2A, cmd, arg) };
         let _ = rc;
     }
     requested

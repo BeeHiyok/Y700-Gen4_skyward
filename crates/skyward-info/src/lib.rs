@@ -45,6 +45,9 @@ pub struct DeviceInfo {
     pub slot: Option<Slot>,
     pub snapshot: SnapshotState,
     pub boot: Boot,
+    /// The phone's port can be a host, and the configuration says where a
+    /// stick plugged into it is shown.
+    pub otg: bool,
 }
 
 /// `ro.build.version.security_patch`, a calendar date.
@@ -168,6 +171,7 @@ pub fn collect(cfg: &DeviceConfig) -> Result<DeviceInfo> {
         slot: skyward_vab::current_slot()?,
         snapshot: skyward_vab::snapshot_state()?,
         boot: Boot { unlocked, verified: skyward_block::boot_param("androidboot.verifiedbootstate")? },
+        otg: cfg.otg.is_some(),
     })
 }
 

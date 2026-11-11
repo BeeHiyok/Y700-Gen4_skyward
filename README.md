@@ -221,7 +221,57 @@ recovery 的 fstab 与 init 都没有 SD 卡条目，新增 `sd.rs` 扫描
 
 ---
 
-## 许可与致谢
+## 充电与 OTG：同一个根因
+
+这台机器的 5V 供电和 Type-C 角色**不由 Linux 控制**：设备树里 `ssusb@a600000` 的
+供电是 `dummy-supply`，真正管它的是 PMIC 上的 PD 固件，通过
+`pmic_glink → ucsi_qti_glink → qti_battery_charger` 这条链，而这段固件**跑在 ADSP 上**。
+
+recovery 里 ADSP 默认 offline——内核在 **1.08 秒**就尝试启动它，那时 `/firmware`
+还没挂载：
+
+```text
+[1.088157] remoteproc0: Direct firmware load for adsp.mdt failed with error -2
+[1.088163] request_firmware failed: -2
+```
+
+后果有两个，都是同一个原因：
+
+| | 充电 | adb |
+|---|---|---|
+| ADSP 关闭（默认） | ❌ 完全无电流 | ✅ |
+| ADSP 启动（`[power] charge = true`） | ✅ 两个口都能充 | ❌ 端口只取电，不枚举 |
+
+`charge = true` 时 Skyward 会先挂 `/firmware`、启动 ADSP、等 `power_supply` 出现，
+再把 UDC 重绑并走 `none → adb` 重建 gadget；每一步写进
+`/mnt/vendor/persist/skyward-power.log`（重启后仍可读，dmesg 会丢）。
+
+**为什么不能共存**：PD 栈起来后只把端口当成取电（日志里 `usb-online = 0`、
+`usb-type = Unknown`，而 Android 里是 `online = 1`、`real_type = PD`）。
+Type-C 要传数据，除了 CC 角色还得把数据通道经 mux（`fsa4480` / `ptn3222`）
+路由到 SoC，这一步由 PD 栈按协商结果做，而 Android 里是 USB HAL 通知它"要数据"，
+recovery 没有这个 HAL。内核侧一切正常（`mode=peripheral`、`role=device`、
+UDC 已绑、`sys.usb.state=adb`），**唯独物理数据通路没被打开**。
+
+所以 **U 盘（OTG）在 recovery 里也拿不到 5V**，插上不会枚举。
+纯 sysfs 手段无效：`typec/port0/data_role` 是只读状态量，`usb/input_suspend=0`、
+重插数据线都不能恢复枚举。
+
+这不是移植引入的回归：TWRP 在这台机器上同样不跑 PD 栈（它的 init 里
+`wait /sys/class/power_supply/battery` 同样超时失败），表现一致。
+
+**替代方案**：`adb push` / MTP 传文件、外置 SD 卡 `/external_sd`；
+需要充电时用 `charge = true` 的配置，或直接开机进系统充。
+
+## 重启目标
+
+`system` / `recovery` / `bootloader` / `edl` 都验证可用。
+
+`bootloader` 和 `edl` 走内核的 `RESTART2` + 字符串（`"bootloader"` / `"edl"`），
+**不经过 `sys.powerctl`**：recovery 的 init 只认 `reboot,` 前缀，会直接做普通重启，
+结果就是"点 bootloader 却回到系统"。
+
+
 
 - 本仓库的补丁衍生自 [kirklin/skyward](https://github.com/kirklin/skyward)，遵循 **GPL-3.0**。
 - Skyward 是独立实现的 recovery，与本移植无关的 bug 请提到上游。

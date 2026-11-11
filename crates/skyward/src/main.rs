@@ -17,6 +17,8 @@ mod haptics;
 mod input;
 #[cfg(target_os = "android")]
 mod merge;
+mod otg;
+mod power;
 #[cfg(target_os = "android")]
 mod partwork;
 #[cfg(target_os = "android")]
@@ -704,6 +706,9 @@ fn keep_the_cable() {
 fn recovery() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     keep_the_cable();
+    // An earlier run that died with the port a host would leave this one with
+    // no adb at all, so the port is put back before anything else.
+    otg::force_device();
     let run = || -> Result<()> {
         // Open to the programs the recovery runs as other users, the
         // supplicant among them, whatever the umask.
@@ -724,6 +729,13 @@ fn recovery() -> Result<()> {
             bcb::clear(&misc)?;
         }
         let cfg = DeviceConfig::load(Path::new("/").join(ramdisk::CONFIG))?;
+        // The phone charges only while the charger firmware on the ADSP runs,
+        // and on this phone the port then charges without enumerating to a
+        // computer: adb goes. Which one the recovery keeps is the owner's
+        // choice, so it is a setting rather than a decision made here.
+        if cfg.power.charge {
+            power::start_soon();
+        }
         skyward_sys::kmsg(&format!(
             "{} {} recovery up, misc command {:?} args {:?}, asking for {:?}",
             cfg.device.codename,

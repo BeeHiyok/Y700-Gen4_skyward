@@ -5,6 +5,7 @@ use crate::haptics::Haptics;
 use crate::relabel;
 use crate::input::{monotonic_ms, Event, Inputs};
 use crate::merge;
+use crate::otg;
 use crate::partwork;
 use crate::pty;
 use crate::readings::{Reading, Readings};
@@ -1065,6 +1066,9 @@ fn wait(fds: &[i32], timeout_ms: i32) -> Result<()> {
 
 /// Run the pages. What `request`, read from misc, asks for decides the
 /// first of them; asking for nothing, they start at `start`.
+/// What the USB host page says when the configuration has no [otg] section.
+const USB_HOST_NONE: &str = "this phone's configuration has no [otg] section, so the port cannot be given to a stick";
+
 pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, start: Screen, dump: Option<&Path>) -> Result<()> {
     if cfg.display.density == 0 {
         return Err(anyhow!("{}: [display] density is required to lay out the UI", cfg.device.codename));
@@ -1392,6 +1396,8 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     let mut plugged: Option<Plugged> = None;
     let mut seen: Option<String> = None;
     let mut drive_at = Instant::now();
+    // When the port was given to a host, while it is with one.
+    let mut host_since: Option<Instant> = None;
     loop {
         let now = monotonic_ms();
         if leave_at.is_some_and(|at| now >= at) {
@@ -1647,6 +1653,21 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         if drive_at.elapsed().as_secs() >= 1 {
             drive_told = look_for_drive(&mut plugged, &mut seen)?;
             drive_at = Instant::now();
+            // The port is with a stick only while there is one. A stick taken
+            // out — or one that never came — gives the port back, so adb
+            // returns without the user having to find the page again while
+            // the screen has no adb to reach it.
+            if let Some(since) = host_since {
+                let patience = cfg.otg.as_ref().map_or(20, |o| o.wait_seconds);
+                let left = drive_told == Some(None);
+                let never = plugged.is_none() && since.elapsed().as_secs() >= patience;
+                if left || never {
+                    skyward_sys::kmsg("the port goes back to the computer")?;
+                    host_since = None;
+                    app.usb_host_done(false, otg::to_device().map_err(|e| format!("{e:#}")));
+                    drive_told = Some(None);
+                }
+            }
         }
         // What the installer and the eraser told comes first, so a touch
         // acts on the page as it now stands.
@@ -2318,6 +2339,22 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                             app.install(cancelled, now);
                         }
                     },
+                    Effect::UsbHost(host) => {
+                        if cfg.otg.is_none() {
+                            app.usb_host_done(host, Err(USB_HOST_NONE.to_string()));
+                        } else if host {
+                            match otg::to_host() {
+                                Ok(()) => {
+                                    host_since = Some(Instant::now());
+                                    app.usb_host_done(true, Ok(()));
+                                }
+                                Err(e) => app.usb_host_done(true, Err(format!("{e:#}"))),
+                            }
+                        } else {
+                            host_since = None;
+                            app.usb_host_done(false, otg::to_device().map_err(|e| format!("{e:#}")));
+                        }
+                    }
                     Effect::ReadMounts => app.set_mounts(mounts()),
                     Effect::ReadSlots => app.set_boot_slots(read_slots()),
                     Effect::SetSlot(slot) => app.slot_switched(set_slot(slot), now),

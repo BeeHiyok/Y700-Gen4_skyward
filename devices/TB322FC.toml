@@ -42,6 +42,21 @@ mounted = []
 mount = "/external_sd"
 wait_seconds = 8
 
+# The port as a host, for a USB stick. This phone switches its Type-C role
+# from software the installed system runs (UCSI), which a recovery has none
+# of, so a stick plugged in is never seen. The recovery asks the controller
+# itself instead, and gives the port back when the stick goes. adb and file
+# transfer are off while a stick is on the port: it is one port, doing one
+# thing at a time.
+[otg]
+wait_seconds = 20
+
+# 充电：recovery 里默认不充电，因为充电/PD 固件跑在 ADSP 上，recovery 不起它。
+# 打开后手机会正常充电，但实测这台机器上端口会变成「只充电、不枚举」，
+# adb 随之断开，两个 USB 口都一样。需要 adb 时保持 false。
+[power]
+charge = false
+
 [backup]
 efs = ["modemst1", "modemst2", "fsg", "fsc", "persist"]
 data_skipped = []

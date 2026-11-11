@@ -48,7 +48,7 @@ index f75cbad..11343b4 100644
  /// One filesystem the phone knows about.
  #[derive(Debug, Clone, PartialEq, Eq)]
 diff --git a/crates/skyward-config/src/lib.rs b/crates/skyward-config/src/lib.rs
-index 441ee4e..5f4ce00 100644
+index 441ee4e..4f3ee02 100644
 --- a/crates/skyward-config/src/lib.rs
 +++ b/crates/skyward-config/src/lib.rs
 @@ -46,6 +46,10 @@ pub struct DeviceConfig {
@@ -62,7 +62,7 @@ index 441ee4e..5f4ce00 100644
      #[serde(default)]
      pub modules: Modules,
      #[serde(default)]
-@@ -77,6 +81,10 @@ pub struct DeviceConfig {
+@@ -77,6 +81,16 @@ pub struct DeviceConfig {
      /// The phone's WLAN, on phones whose driver the recovery brings up.
      #[serde(default)]
      pub wlan: Option<Wlan>,
@@ -70,10 +70,16 @@ index 441ee4e..5f4ce00 100644
 +    /// itself, since a recovery's table names no card.
 +    #[serde(default)]
 +    pub sd: Option<Sd>,
++    /// The port as a host, for a USB stick, on phones whose port can be one.
++    #[serde(default)]
++    pub otg: Option<Otg>,
++    /// Charging while the recovery runs, where the phone would otherwise not.
++    #[serde(default)]
++    pub power: Power,
      /// Where the phone maker answers which system is the newest, on phones
      /// whose server the recovery knows.
      #[serde(default)]
-@@ -99,6 +107,31 @@ pub struct Stock {
+@@ -99,6 +113,61 @@ pub struct Stock {
      pub recovery: String,
  }
  
@@ -102,10 +108,40 @@ index 441ee4e..5f4ce00 100644
 +    8
 +}
 +
++/// The port as a host, for a USB stick plugged into it. A phone's port is
++/// either a device or a host, never both, so the recovery gives it to a
++/// stick only when asked, and gives it back afterwards. A phone whose
++/// Type-C controller is driven by software the installed system runs does
++/// not switch by itself in a recovery, which is what this is for.
++#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
++pub struct Otg {
++    /// How long to wait for a stick to appear before giving the port back,
++    /// in seconds.
++    #[serde(default = "otg_wait_seconds")]
++    pub wait_seconds: u64,
++}
++
++fn otg_wait_seconds() -> u64 {
++    20
++}
++
++/// The charger firmware on the ADSP, which a recovery does not run.
++///
++/// Without it the phone does not charge at all: the port draws no current,
++/// whatever the cable. With it, charging works but on phones whose Type-C
++/// controller then takes the port for charging alone, adb is gone. So the
++/// recovery starts it only when the owner asks for charging.
++#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
++pub struct Power {
++    /// Start it, and let the phone charge while the recovery runs.
++    #[serde(default)]
++    pub charge: bool,
++}
++
  /// What brings the phone's WLAN up inside a recovery, which loads none of
  /// it: the driver, what it reads as it starts, and the phone's own
  /// wpa_supplicant, which joins networks.
-@@ -212,8 +245,14 @@ pub struct Haptics {
+@@ -212,8 +281,14 @@ pub struct Haptics {
      #[serde(default)]
      pub click: Option<i16>,
      /// The file the driver says the motor's resonant frequency in, in
@@ -122,7 +158,7 @@ index 441ee4e..5f4ce00 100644
      pub strength: Strength,
  }
  
-@@ -544,8 +583,16 @@ impl DeviceConfig {
+@@ -544,8 +619,16 @@ impl DeviceConfig {
              ensure!(plain && !folder.is_empty(), "[backup] data_skipped: {folder} is not a path from the top of {DATA}");
          }
          if let Some(haptics) = &cfg.haptics {
@@ -141,7 +177,7 @@ index 441ee4e..5f4ce00 100644
              let Strength { lightest, strongest } = haptics.strength;
              ensure!(
                  0.0 < lightest && lightest < strongest && strongest <= 1.0,
-@@ -585,6 +632,12 @@ impl DeviceConfig {
+@@ -585,6 +668,15 @@ impl DeviceConfig {
                  stock.recovery
              );
          }
@@ -151,10 +187,13 @@ index 441ee4e..5f4ce00 100644
 +            ensure!(at.is_absolute() && plain && sd.mount != "/", "[sd] mount: {} is not an absolute path to a folder", sd.mount);
 +            ensure!(sd.wait_seconds <= 120, "[sd] wait_seconds: {} is longer than two minutes", sd.wait_seconds);
 +        }
++        if let Some(otg) = &cfg.otg {
++            ensure!((5..=120).contains(&otg.wait_seconds), "[otg] wait_seconds: {} is not from 5 to 120", otg.wait_seconds);
++        }
          if let Some(wlan) = &cfg.wlan {
              ensure!(wlan.probe.starts_with("http://"), "[wlan] probe: {} is not a plain HTTP address", wlan.probe);
              for file in &wlan.firmware {
-@@ -646,7 +699,7 @@ mod tests {
+@@ -646,7 +738,7 @@ mod tests {
      fn ishtar_clicks_with_a_waveform_its_driver_keeps() {
          let cfg = DeviceConfig::parse(include_str!("../../../devices/ishtar.toml")).unwrap();
          let haptics = cfg.haptics.expect("the 13 Ultra has a motor");
@@ -163,7 +202,7 @@ index 441ee4e..5f4ce00 100644
          assert_eq!(haptics.strength, Strength { lightest: 0.5, strongest: 1.0 });
      }
  
-@@ -739,7 +792,7 @@ mod tests {
+@@ -739,7 +831,7 @@ mod tests {
          assert_eq!(weaver.ready_service.as_deref(), Some("android.hardware.weaver.IWeaver/default"));
          assert_eq!(boot.ready_service.as_deref(), Some("android.hardware.boot.IBootControl/default"));
          let haptics = cfg.haptics.expect("the 17 Ultra has a motor");
@@ -173,10 +212,20 @@ index 441ee4e..5f4ce00 100644
          assert_eq!(cfg.backup.efs, ["modemst1", "modemst2", "fsg", "fsc", "persist"]);
          assert!(cfg.backup.data_skipped.contains(&"vendor/goodix".to_string()));
 diff --git a/crates/skyward-info/src/lib.rs b/crates/skyward-info/src/lib.rs
-index 3e53f7f..06650fa 100644
+index 3e53f7f..aa1d271 100644
 --- a/crates/skyward-info/src/lib.rs
 +++ b/crates/skyward-info/src/lib.rs
-@@ -148,7 +148,13 @@ pub fn collect(cfg: &DeviceConfig) -> Result<DeviceInfo> {
+@@ -45,6 +45,9 @@ pub struct DeviceInfo {
+     pub slot: Option<Slot>,
+     pub snapshot: SnapshotState,
+     pub boot: Boot,
++    /// The phone's port can be a host, and the configuration says where a
++    /// stick plugged into it is shown.
++    pub otg: bool,
+ }
+ 
+ /// `ro.build.version.security_patch`, a calendar date.
+@@ -148,7 +151,13 @@ pub fn collect(cfg: &DeviceConfig) -> Result<DeviceInfo> {
          model: system.get("ro.product.marketname").unwrap_or_else(|| cfg.device.model.clone()),
          codename: cfg.device.codename.clone(),
          soc: cfg.device.soc.clone(),
@@ -191,6 +240,14 @@ index 3e53f7f..06650fa 100644
          ram_kib: mem_total(&read("/proc/meminfo")?)?,
          panel: (d.width > 0 && d.height > 0).then_some((d.width, d.height)),
          screen: d.diagonal,
+@@ -162,6 +171,7 @@ pub fn collect(cfg: &DeviceConfig) -> Result<DeviceInfo> {
+         slot: skyward_vab::current_slot()?,
+         snapshot: skyward_vab::snapshot_state()?,
+         boot: Boot { unlocked, verified: skyward_block::boot_param("androidboot.verifiedbootstate")? },
++        otg: cfg.otg.is_some(),
+     })
+ }
+ 
 diff --git a/crates/skyward-modules/src/lib.rs b/crates/skyward-modules/src/lib.rs
 index ec33ac9..69cfb53 100644
 --- a/crates/skyward-modules/src/lib.rs
@@ -242,10 +299,10 @@ index ec33ac9..69cfb53 100644
              loaded.push(path);
          }
 diff --git a/crates/skyward-sys/src/lib.rs b/crates/skyward-sys/src/lib.rs
-index fc11ddf..c242ad9 100644
+index fc11ddf..a482e57 100644
 --- a/crates/skyward-sys/src/lib.rs
 +++ b/crates/skyward-sys/src/lib.rs
-@@ -157,7 +157,54 @@ impl Power {
+@@ -157,7 +157,68 @@ impl Power {
  }
  
  pub fn power(target: Power) -> Result<()> {
@@ -253,7 +310,15 @@ index fc11ddf..c242ad9 100644
 +    // Some recovery init implementations ignore sys.powerctl. Fall back to a
 +    // direct kernel reboot after syncing; for recovery/fastboot also leave the
 +    // matching bootloader control block so the bootloader selects the target.
-+    let requested = set_prop("sys.powerctl", target.command());
++    //
++    // The bootloader and EDL are asked for by the kernel's own restart with a
++    // string, and not through sys.powerctl: a recovery init that only looks at
++    // the "reboot," part of the value reboots into the system before this can
++    // run, which is exactly what a bootloader request must not do.
++    let requested = match target {
++        Power::Bootloader | Power::Edl => Ok(()),
++        _ => set_prop("sys.powerctl", target.command()),
++    };
 +    sync_all();
 +    #[cfg(target_os = "android")]
 +    {
@@ -279,13 +344,19 @@ index fc11ddf..c242ad9 100644
 +        const LINUX_REBOOT_MAGIC2A: libc::c_ulong = 672_274_793;
 +        const LINUX_REBOOT_CMD_RESTART: libc::c_ulong = 0x0123_4567;
 +        const LINUX_REBOOT_CMD_POWER_OFF: libc::c_ulong = 0x4321_fedc;
-+        let cmd = match target {
-+            Power::Off => LINUX_REBOOT_CMD_POWER_OFF,
-+            _ => LINUX_REBOOT_CMD_RESTART,
++        // RESTART2 carries a string to the bootloader, which is how Android
++        // itself asks for the bootloader: a plain restart would land in the
++        // system, since nothing in the boot chain would be asked otherwise.
++        const LINUX_REBOOT_CMD_RESTART2: libc::c_ulong = 0xa1b2_c3d4;
++        let (cmd, arg): (libc::c_ulong, usize) = match target {
++            Power::Off => (LINUX_REBOOT_CMD_POWER_OFF, 0),
++            Power::Bootloader => (LINUX_REBOOT_CMD_RESTART2, b"bootloader\0".as_ptr() as usize),
++            Power::Edl => (LINUX_REBOOT_CMD_RESTART2, b"edl\0".as_ptr() as usize),
++            _ => (LINUX_REBOOT_CMD_RESTART, 0),
 +        };
 +        // reboot(2) never returns on success. If it fails, preserve the
 +        // original property-service error for the caller.
-+        let rc = unsafe { libc::syscall(SYS_REBOOT_AARCH64, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2A, cmd, 0usize) };
++        let rc = unsafe { libc::syscall(SYS_REBOOT_AARCH64, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2A, cmd, arg) };
 +        let _ = rc;
 +    }
 +    requested
@@ -301,6 +372,201 @@ index fc11ddf..c242ad9 100644
  }
  
  /// The folder the recovery service keeps what it makes for itself in, for
+diff --git a/crates/skyward-ui/src/app.rs b/crates/skyward-ui/src/app.rs
+index fe3a1b6..f473d9e 100644
+--- a/crates/skyward-ui/src/app.rs
++++ b/crates/skyward-ui/src/app.rs
+@@ -62,6 +62,8 @@ pub enum Screen {
+     BackupJob,
+     /// Tools for the experienced: files, a terminal, the logs.
+     Advanced,
++    /// The port as a host, for a USB stick plugged into it.
++    UsbHost,
+     Files,
+     /// One file, and what can be done with it.
+     FileInfo,
+@@ -1185,6 +1187,8 @@ pub enum Action {
+     Pattern,
+     /// Start receiving a package over USB.
+     Sideload,
++    /// Give the port to a USB stick, or give it back to the computer.
++    UsbHost(bool),
+     /// Send the image to one of the partitions it fits.
+     FlashPartition(usize),
+     /// Send the image to these slots.
+@@ -1571,6 +1575,22 @@ impl Frame {
+     }
+ }
+ 
++/// What the USB host page last asked the runtime for, and how it went.
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub enum UsbHost {
++    /// The page has not been used since the recovery started.
++    #[default]
++    Idle,
++    /// The runtime is moving the port, to a stick when true and back to the
++    /// computer when false.
++    Working(bool),
++    /// The port is with a stick when true, and back with the computer when
++    /// false.
++    Done { host: bool },
++    /// It did not work, and this is why.
++    Failed(String),
++}
++
+ /// Choices the pages show and the user changes, and where installing
+ /// stands.
+ #[derive(Clone, Debug, PartialEq)]
+@@ -1628,6 +1648,9 @@ pub struct State {
+     /// it could not.
+     pub mounts: Result<Vec<MountRow>, String>,
+     pub mount_failure: Option<MountFailure>,
++    /// The port as a host: what the USB host page last asked for and how it
++    /// went. Nothing of it is kept in the settings: it describes this run.
++    pub usb_host: UsbHost,
+     /// Which of [`BACKUP_PARTS`] a backup takes.
+     pub backup: [bool; 4],
+     /// Where a backup goes.
+@@ -1781,6 +1804,7 @@ impl Default for State {
+             reflash: None,
+             mounts: Ok(Vec::new()),
+             mount_failure: None,
++            usb_host: UsbHost::Idle,
+             backup: [true, true, false, true],
+             backup_to: Place::Storage,
+             compress: false,
+@@ -1966,6 +1990,9 @@ pub enum Effect {
+     FileTransfer(bool),
+     /// Start receiving a package over USB.
+     Sideload,
++    /// Give the port to a USB stick, or give it back to the computer,
++    /// telling how it went with [`App::usb_host_done`].
++    UsbHost(bool),
+     /// Start installing the file at this path from the top of a place,
+     /// telling how it goes as [`Effect::Sideload`] does.
+     InstallFile(Place, String),
+@@ -3313,6 +3340,22 @@ impl App {
+         }
+     }
+ 
++    /// The USB host page asked for the port: it is being moved, to a stick
++    /// when `host`, and back to the computer otherwise.
++    pub fn usb_host_working(&mut self, host: bool) {
++        self.state.usb_host = UsbHost::Working(host);
++        self.refresh();
++    }
++
++    /// How giving the port to a stick, or back to the computer, went.
++    pub fn usb_host_done(&mut self, host: bool, outcome: Result<(), String>) {
++        self.state.usb_host = match outcome {
++            Ok(()) => UsbHost::Done { host },
++            Err(text) => UsbHost::Failed(text),
++        };
++        self.refresh();
++    }
++
+     /// The runtime read whether fastbootd runs and how far a computer has
+     /// the port: keep it and show it if it changed.
+     pub fn set_fastboot(&mut self, running: bool, link: UsbLink) {
+@@ -5213,6 +5256,10 @@ impl App {
+             }
+             Action::Confirm(_) => self.say(l.pick(["请按住圆形按钮向右滑动", "請按住圓形按鈕向右滑動", "Hold the round button and slide it right"]), now),
+             Action::Slider(_) | Action::Pattern => {}
++            Action::UsbHost(host) => {
++                self.usb_host_working(host);
++                return vec![Effect::UsbHost(host)];
++            }
+             Action::Sideload => match self.state.install {
+                 Install::Idle | Install::Finished { .. } => {
+                     self.begin_install(Install::Starting, Source::Computer, None);
+diff --git a/crates/skyward-ui/src/pages.rs b/crates/skyward-ui/src/pages.rs
+index 5216cb6..1e63aa4 100644
+--- a/crates/skyward-ui/src/pages.rs
++++ b/crates/skyward-ui/src/pages.rs
+@@ -1,7 +1,7 @@
+ use crate::app::{
+     Action, BackupAt, BackupEnd, BackupJob, Check, ClashChoice, Confirm, Damage, Data, Dock, DownloadEnd, EraseStop, Field, FileKind,
+     FileOp, FileTask, Fold, Folder, Frame, FsAction, FsChoice, FsRow, Have, HeroArt, Hit, Install, JobEnd, Keys, Pick, Place, Rows, Screen,
+-    SkywardCheck, SkywardEnd, SkywardJob, SkywardStage, Slider, Source, State, Switch, SystemsWork, Target, UsbDrive, UsbLink, Wipe, ADDABLE,
++    SkywardCheck, SkywardEnd, SkywardJob, SkywardStage, Slider, Source, State, Switch, SystemsWork, Target, UsbDrive, UsbHost, UsbLink, Wipe, ADDABLE,
+     BACKUP_PARTS, DATA_ERASED, DATA_PARTITION, DOWNLOADS, FASTBOOT_CHOICES, SCREEN_OFF, TARGETS, TIME_ZONES, USB_DRIVE_UNREADABLE,
+     USB_DRIVE_WANTED, WIPES, installs, starting,
+ };
+@@ -80,6 +80,7 @@ pub fn render(screen: Screen, cx: &Ctx) -> Frame {
+         Screen::RestoreBackup => restore_backup(cx),
+         Screen::BackupJob => backup_job(cx),
+         Screen::Advanced => advanced(cx),
++        Screen::UsbHost => usb_host(cx),
+         Screen::Files => files(cx),
+         Screen::FileInfo => file_info(cx),
+         Screen::Permissions => permissions(cx),
+@@ -379,6 +380,13 @@ pub fn settings(cx: &Ctx) -> Frame {
+     y = widgets::section(&mut c, t, f, general.bottom, "USB");
+     let usb = widgets::list(&mut c, t, f, y, &[Row::new(l.pick(["文件传输", "檔案傳輸", "File transfer"])).icon(BLUE, Icon::Usb).trail(Trail::Switch(s.file_transfer))]);
+     out.extend(hits(&usb.rows, &[Action::Toggle(Switch::FileTransfer)]));
++    // The port as a host, on phones whose port can be one: a stick plugged
++    // into it is mounted for the file manager.
++    if cx.info.otg {
++        let state = usb_host_value(l, s);
++        let host = widgets::list(&mut c, t, f, usb.bottom, &[Row::new(l.pick(USB_HOST)).icon(BLUE, Icon::UsbDrive).trail(Trail::Value(&state))]);
++        out.extend(hits(&host.rows, &[Action::Open(Screen::UsbHost)]));
++    }
+     let note = l.pick([
+         "开启后，可在电脑上管理内部存储中的文件，需先完成「解密」。",
+         "開啟後，可在電腦上管理內部儲存空間中的檔案，需先完成「解密」。",
+@@ -2219,6 +2227,52 @@ pub fn advanced(cx: &Ctx) -> Frame {
+     Frame::new(t, c, out, l.pick(ADVANCED), top)
+ }
+ 
++const USB_HOST: Text = ["USB 主机（OTG）", "USB 主機（OTG）", "USB host (OTG)"];
++const USB_HOST_ON: Text = ["接上 U 盘", "接上 U 盤", "Take a USB stick"];
++const USB_HOST_OFF: Text = ["还给电脑", "還給電腦", "Give the port back"];
++
++/// What the settings row says of the port.
++fn usb_host_value(l: Lang, s: &State) -> &'static str {
++    match &s.usb_host {
++        UsbHost::Idle | UsbHost::Done { host: false, .. } => l.pick(["关", "關", "Off"]),
++        UsbHost::Working(_) => l.pick(["切换中", "切換中", "Switching"]),
++        UsbHost::Done { host: true, .. } => l.pick(["已接上", "已接上", "On"]),
++        UsbHost::Failed(_) => l.pick(["失败", "失敗", "Failed"]),
++    }
++}
++
++/// The port as a host: a stick plugged into it is found by the recovery and
++/// shown in the file manager, at the cost of adb and file transfer while it
++/// is there.
++pub fn usb_host(cx: &Ctx) -> Frame {
++    let (t, f, l) = (cx.t, cx.f, cx.state.lang);
++    let mut c = page(cx);
++    let top = t.m.content_top;
++    let rows = widgets::list(&mut c, t, f, top, &[
++        Row::new(l.pick(USB_HOST_ON)).icon(BLUE, Icon::UsbDrive),
++        Row::new(l.pick(USB_HOST_OFF)).icon(SLATE, Icon::Usb),
++    ]);
++    let out = hits(&rows.rows, &[Action::UsbHost(true), Action::UsbHost(false)]);
++    let note = match &cx.state.usb_host {
++        UsbHost::Idle => l.pick([
++            "这个口同一时间只做一件事：接上 U 盘时 adb 与文件传输会断开，U 盘拔掉后自动还给电脑。",
++            "這個埠同一時間只做一件事：接上 U 盤時 adb 與檔案傳輸會斷開，U 盤拔掉後自動還給電腦。",
++            "The port does one thing at a time: with a stick on it adb and file transfer are off, and it goes back to the computer once the stick is taken out.",
++        ]).to_string(),
++        UsbHost::Working(true) => l.pick(["正在把端口交给 USB 主机…", "正在把埠交給 USB 主機…", "Giving the port to a host…"]).to_string(),
++        UsbHost::Working(false) => l.pick(["正在把端口还给电脑…", "正在把埠還給電腦…", "Giving the port back…"]).to_string(),
++        UsbHost::Done { host: true } => l.pick([
++            "端口已交给 USB 主机。插上 U 盘后，在「高级 → 文件管理」的根目录里打开它；U 盘拔掉后端口会自动还给电脑。",
++            "埠已交給 USB 主機。插上 U 盤後，在「進階 → 檔案管理」的根目錄裡打開它；U 盤拔掉後埠會自動還給電腦。",
++            "The port is with a USB host. Plug the stick in and open it from the root of Advanced → File manager; the port goes back to the computer once the stick is taken out.",
++        ]).to_string(),
++        UsbHost::Done { host: false } => l.pick(["端口已还给电脑，adb 与文件传输已恢复。", "埠已還給電腦，adb 與檔案傳輸已恢復。", "The port is back with the computer: adb and file transfer work again."]).to_string(),
++        UsbHost::Failed(text) => text.clone(),
++    };
++    widgets::footnote(&mut c, t, f, rows.bottom, &note);
++    Frame::new(t, c, out, l.pick(USB_HOST), top)
++}
++
+ const RELABEL: Text = ["修复 SELinux 上下文", "修復 SELinux 上下文", "Fix SELinux contexts"];
+ const FILESYSTEMS: Text = ["文件系统", "檔案系統", "Filesystems"];
+ const STOPPED: Text = ["已停止", "已停止", "Stopped"];
 diff --git a/crates/skyward-ui/src/surface.rs b/crates/skyward-ui/src/surface.rs
 index ab27c29..3139a6a 100644
 --- a/crates/skyward-ui/src/surface.rs
@@ -437,10 +703,19 @@ index c36d1c7..1e1dcab 100644
              Some(id) => {
                  eprintln!("haptics {}: clicks with waveform {id}, ticks made for a motor swinging at {hz} Hz", path.display());
 diff --git a/crates/skyward/src/main.rs b/crates/skyward/src/main.rs
-index 1a4c1f0..ac399d8 100644
+index 1a4c1f0..c6090ec 100644
 --- a/crates/skyward/src/main.rs
 +++ b/crates/skyward/src/main.rs
-@@ -25,6 +25,7 @@ mod pty;
+@@ -17,6 +17,8 @@ mod haptics;
+ mod input;
+ #[cfg(target_os = "android")]
+ mod merge;
++mod otg;
++mod power;
+ #[cfg(target_os = "android")]
+ mod partwork;
+ #[cfg(target_os = "android")]
+@@ -25,6 +27,7 @@ mod pty;
  mod readings;
  #[cfg(target_os = "android")]
  mod relabel;
@@ -448,7 +723,7 @@ index 1a4c1f0..ac399d8 100644
  #[cfg(target_os = "android")]
  mod secure;
  #[cfg(target_os = "android")]
-@@ -510,6 +511,11 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<()> {
+@@ -510,6 +513,11 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<()> {
          let at = skyward_block::fstab::mount(name)?;
          skyward_sys::kmsg(&format!("{name} is mounted on {}", at.display()))?;
      }
@@ -460,7 +735,7 @@ index 1a4c1f0..ac399d8 100644
      for path in load_modules(cfg, &cfg.modules.load)? {
          skyward_sys::kmsg(&format!("loaded {}", path.display()))?;
      }
-@@ -674,8 +680,30 @@ fn adopt_installed_version(props: &std::collections::HashMap<String, String>) ->
+@@ -674,8 +682,33 @@ fn adopt_installed_version(props: &std::collections::HashMap<String, String>) ->
  /// goes on stays in misc until the work is done; any other is cleared at
  /// once, so that any reboot from here boots the system. Failures go to the
  /// kernel log and still end the process, which init then starts again.
@@ -488,9 +763,348 @@ index 1a4c1f0..ac399d8 100644
  fn recovery() -> Result<()> {
      use std::os::unix::fs::PermissionsExt;
 +    keep_the_cable();
++    // An earlier run that died with the port a host would leave this one with
++    // no adb at all, so the port is put back before anything else.
++    otg::force_device();
      let run = || -> Result<()> {
          // Open to the programs the recovery runs as other users, the
          // supplicant among them, whatever the umask.
+@@ -696,6 +729,13 @@ fn recovery() -> Result<()> {
+             bcb::clear(&misc)?;
+         }
+         let cfg = DeviceConfig::load(Path::new("/").join(ramdisk::CONFIG))?;
++        // The phone charges only while the charger firmware on the ADSP runs,
++        // and on this phone the port then charges without enumerating to a
++        // computer: adb goes. Which one the recovery keeps is the owner's
++        // choice, so it is a setting rather than a decision made here.
++        if cfg.power.charge {
++            power::start_soon();
++        }
+         skyward_sys::kmsg(&format!(
+             "{} {} recovery up, misc command {:?} args {:?}, asking for {:?}",
+             cfg.device.codename,
+diff --git a/crates/skyward/src/otg.rs b/crates/skyward/src/otg.rs
+new file mode 100644
+index 0000000..68e2184
+--- /dev/null
++++ b/crates/skyward/src/otg.rs
+@@ -0,0 +1,97 @@
++//! The port as a host, for a USB stick plugged into it.
++//!
++//! A phone's port is a device by default, and what turns it into a host is the
++//! Type-C controller's software: UCSI, driven by the installed system's
++//! firmware and daemons. A recovery runs none of that, so on this phone a stick
++//! plugged in is never seen — the controller never switches, and nothing
++//! enumerates. The recovery asks the controller directly instead.
++//!
++//! The port cannot be both: while it is a host, adb and file transfer are
++//! gone. So it is given to a stick only when the pages ask, and given back as
++//! soon as the stick goes, or when none appeared at all.
++
++use anyhow::{bail, Context, Result};
++use std::time::Duration;
++
++/// Where the port is told to be a host, or a device again. The controller
++/// underneath is a dwc3; this node is the one its glue driver exposes, and
++/// writing it goes through the same role change UCSI would ask for, boost
++/// supply and all.
++const MODE: &str = "/sys/bus/platform/devices/a600000.ssusb/mode";
++
++/// What the controller says the port is now.
++fn mode() -> String {
++    std::fs::read_to_string(MODE).map(|m| m.trim().to_string()).unwrap_or_default()
++}
++
++/// Whether the port is a host now.
++pub fn is_host() -> bool {
++    mode() == "host"
++}
++
++/// Whether the port can power a stick at all on this phone, now.
++///
++/// The 5 V a stick needs is not a kernel regulator here: the controller's
++/// supply is a dummy, and the boost that feeds the port belongs to the PMIC's
++/// charger, which runs on the ADSP. `power::start` brings that up; when it did
++/// not, no stick would ever be powered and taking the port would only lose
++/// adb.
++fn can_power_a_stick() -> bool {
++    crate::power::up()
++}
++
++/// Give the port to a host controller, so a stick plugged into it enumerates.
++pub fn to_host() -> Result<()> {
++    if !can_power_a_stick() {
++        bail!(
++            "这个口要靠充电/PD 固件提供 5V，而 recovery 里那套没有起来，接上 U 盘也不会枚举。用 adb 或 SD 卡传文件。"
++        );
++    }
++    // A gadget still bound holds the controller in device mode, and its adbd
++    // holds the port, so it goes first.
++    let _ = skyward_sys::usb::set("none", Duration::from_secs(5));
++    std::fs::write(MODE, "host").with_context(|| format!("write host to {MODE}"))?;
++    std::thread::sleep(Duration::from_millis(400));
++    if !is_host() {
++        // Put it back the way it was rather than leave the port unusable.
++        let _ = to_device();
++        bail!("the port did not take host mode");
++    }
++    skyward_sys::kmsg("the port is a host now: a USB stick plugged in shows under /mnt/usb")?;
++    Ok(())
++}
++
++/// Give the port back to the computer, so adb and file transfer return.
++pub fn to_device() -> Result<()> {
++    std::fs::write(MODE, "peripheral").with_context(|| format!("write peripheral to {MODE}"))?;
++    std::thread::sleep(Duration::from_millis(400));
++    // The gadget comes back once the controller is a device again, which is
++    // not at once: init has to see the role change first.
++    let until = std::time::Instant::now() + Duration::from_secs(10);
++    let mut last = None;
++    while std::time::Instant::now() < until {
++        match skyward_sys::usb::set(skyward_sys::usb::resting(), Duration::from_secs(3)) {
++            Ok(()) => {
++                skyward_sys::kmsg("the port is a device again")?;
++                return Ok(());
++            }
++            Err(e) => {
++                last = Some(e);
++                std::thread::sleep(Duration::from_millis(300));
++            }
++        }
++    }
++    Err(last.unwrap_or_else(|| anyhow::anyhow!("the port did not come back")))
++        .context("start the gadget again")
++}
++
++/// Put the port back when the recovery starts, whatever an earlier run — or a
++/// crash while a stick was mounted — left it as. Without this a recovery that
++/// died with the port a host would come back with no adb at all.
++pub fn force_device() {
++    if !is_host() {
++        return;
++    }
++    let _ = std::fs::write(MODE, "peripheral");
++    let _ = skyward_sys::usb::set(skyward_sys::usb::resting(), Duration::from_secs(10));
++}
+diff --git a/crates/skyward/src/power.rs b/crates/skyward/src/power.rs
+new file mode 100644
+index 0000000..06955ed
+--- /dev/null
++++ b/crates/skyward/src/power.rs
+@@ -0,0 +1,213 @@
++//! The charging and port stack.
++//!
++//! The PMIC's charger and the Type-C port controller are not driven by Linux
++//! directly: they run firmware on the ADSP, reached through `pmic_glink`. A
++//! recovery leaves the ADSP offline, and then nothing charges — the port draws
++//! no current at all, whatever the cable — and the port can never be a host,
++//! so a USB stick is never powered. Starting the ADSP from the recovery brings
++//! the whole stack up: `power_supply` fills, the charger runs, and the port
++//! controller can switch roles.
++//!
++//! Starting it resets the USB port, which takes adb down with it, so the port
++//! is given back to the gadget afterwards.
++
++use anyhow::{bail, Context, Result};
++use std::path::{Path, PathBuf};
++use std::time::{Duration, Instant};
++
++/// Where the charger and port controller appear once their firmware runs.
++const SUPPLY: &str = "/sys/class/power_supply";
++
++/// Whether the stack is up: the charger registers its supplies when it is.
++pub fn up() -> bool {
++    std::fs::read_dir(SUPPLY).map(|mut entries| entries.next().is_some()).unwrap_or(false)
++}
++
++/// The ADSP's remoteproc, found by the name of its device rather than by the
++/// number the class gives it: the numbers depend on the order the subsystems
++/// happen to register in, and writing "start" to the modem's would do nothing
++/// useful.
++fn adsp() -> Option<PathBuf> {
++    let devices = std::fs::read_dir("/sys/bus/platform/devices").ok()?;
++    for entry in devices.flatten() {
++        if !entry.file_name().to_string_lossy().contains("remoteproc-adsp") {
++            continue;
++        }
++        let inside = entry.path().join("remoteproc");
++        for rproc in std::fs::read_dir(&inside).ok()?.flatten() {
++            if rproc.path().join("state").is_file() {
++                return Some(rproc.path());
++            }
++        }
++    }
++    None
++}
++
++/// Where the recovery keeps a note of what it did to the port: the kernel log
++/// does not survive the reboot that a port with no adb forces on the user, and
++/// this is the only way to see what happened on the boot that lost it. The
++/// metadata partition is mounted by both the recovery and the system, and
++/// survives a reboot, so the note can be read from either.
++const DIARY: &[&str] = &[
++    "/mnt/vendor/persist/skyward-power.log",
++    "/external_sd/skyward-power.log",
++    "/data/media/skyward-power.log",
++];
++
++/// Note one step of the port's story where it will still be readable after a
++/// reboot.
++fn note(line: &str) {
++    use std::io::Write;
++    let _ = skyward_sys::kmsg(line);
++    for at in DIARY {
++        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(at) {
++            let _ = writeln!(f, "{line}");
++            return;
++        }
++    }
++}
++
++/// Everything the port says about itself, for the diary.
++fn port_facts() -> String {
++    let mut out = String::new();
++    for (label, path) in [
++        ("ucsi-port0-data_role", "/sys/class/typec/port0/data_role"),
++        ("ucsi-port0-power_role", "/sys/class/typec/port0/power_role"),
++        ("ucsi-port0-mode", "/sys/class/typec/port0/power_operation_mode"),
++        ("usb-online", "/sys/class/power_supply/usb/online"),
++        ("usb-suspend", "/sys/class/power_supply/usb/input_suspend"),
++        ("usb-type", "/sys/class/power_supply/usb/real_type"),
++        ("gadget-UDC", "/config/usb_gadget/g1/UDC"),
++        ("ssusb-mode", "/sys/bus/platform/devices/a600000.ssusb/mode"),
++        ("role-switch", "/sys/class/usb_role/a600000.ssusb-role-switch/role"),
++    ] {
++        let value = std::fs::read_to_string(path).map(|v| v.trim().to_string()).unwrap_or_else(|_| "?".into());
++        out.push_str(&format!("{label}={value} "));
++    }
++    let udcs: Vec<String> = std::fs::read_dir("/sys/class/udc")
++        .map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
++        .unwrap_or_default();
++    out.push_str(&format!("udcs={udcs:?}"));
++    out
++}
++
++/// Bring the stack up in the background, trying until the firmware is there.
++///
++/// The recovery starts before its init has mounted the firmware partition,
++/// and the ADSP cannot boot without it, so this waits for the partition and
++/// tries again. It runs off the main thread because starting the ADSP resets
++/// the USB port, and the pages should not wait on that.
++pub fn start_soon() {
++    std::thread::spawn(|| {
++        let until = Instant::now() + Duration::from_secs(120);
++        while Instant::now() < until {
++            if up() {
++                return;
++            }
++            // The firmware partition holds image/ once init has mounted it.
++            if Path::new(FIRMWARE).join("image").is_dir() {
++                if start().is_ok() {
++                    return;
++                }
++            }
++            std::thread::sleep(Duration::from_secs(2));
++        }
++        let _ = skyward_sys::kmsg("the charger did not come up; this recovery will not charge");
++    });
++}
++
++/// Bring the stack up if it is not, and give the port back to the gadget
++/// afterwards. Nothing to do on a phone whose recovery already runs it.
++pub fn start() -> Result<()> {
++    if up() {
++        return Ok(());
++    }
++    // The kernel asks the ADSP to boot at the very start, before anything is
++    // mounted, and the request fails with no firmware to read. The recovery
++    // has the firmware partition by then, so it is mounted here and the boot
++    // asked for again.
++    mount_firmware()?;
++    let Some(adsp) = adsp() else {
++        bail!("this phone has no ADSP to start, so nothing would charge");
++    };
++    let state = adsp.join("state");
++    note(&format!("starting the ADSP for the charger and the port; before: {}", port_facts()));
++    std::fs::write(&state, "start").with_context(|| format!("start {}", state.display()))?;
++
++    // The firmware takes a few seconds to come up, and the charger registers
++    // its supplies once it does.
++    let until = Instant::now() + Duration::from_secs(20);
++    while Instant::now() < until {
++        if up() {
++            let supplies: Vec<String> = std::fs::read_dir(SUPPLY)
++                .map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
++                .unwrap_or_default();
++            note(&format!("the charger is up: supplies={supplies:?} {}", port_facts()));
++            give_the_port_back();
++            return Ok(());
++        }
++        std::thread::sleep(Duration::from_millis(250));
++    }
++    note(&format!("the charger did not come up: {}", port_facts()));
++    // Up or not, the port has to come back: a recovery with no adb is worse
++    // than one that does not charge.
++    give_the_port_back();
++    bail!("the charger did not come up within 20 s")
++}
++
++/// The partition the ADSP's firmware is read from.
++const FIRMWARE: &str = "/firmware";
++
++/// Mount the firmware partition unless it is already there. The ADSP's
++/// request for its firmware is served from userspace through ueventd, so it
++/// has to be mounted before the request, not after.
++fn mount_firmware() -> Result<()> {
++    let at = Path::new(FIRMWARE);
++    if skyward_block::mount::is_mount_point(at)? {
++        return Ok(());
++    }
++    std::fs::create_dir_all(at).with_context(|| format!("make {}", at.display()))?;
++    let partition = Path::new("/dev/block/by-name/firmware");
++    skyward_block::mount::mount_ro(partition, at).context("mount /firmware")?;
++    Ok(())
++}
++
++/// Ask init for the gadget again, since starting the stack reset the port.
++///
++/// It has to go through "none" first: writing the value a property already
++/// holds changes nothing, so init would not rebuild the gadget, and waiting
++/// for a state that never changed would report success while adb stayed dead.
++/// The port itself is asked for data too: the controller came up for a cable
++/// it wants to charge from, and nothing told it that data is wanted.
++fn give_the_port_back() {
++    note(&format!("after the stack: {}", port_facts()));
++    let _ = std::fs::write("/sys/bus/platform/devices/a600000.ssusb/mode", "peripheral");
++    let _ = std::fs::write("/sys/class/typec/port0/data_role", "device");
++    let _ = std::fs::write("/sys/class/typec/port0-data-role", "device");
++    let _ = std::fs::write("/sys/class/power_supply/usb/input_suspend", "0");
++    for attempt in 0..8 {
++        // A controller that lost its gadget needs the binding back, which init
++        // does on its own most of the time; this is for the times it does not.
++        if let Ok(udcs) = std::fs::read_dir("/sys/class/udc") {
++            if let Some(name) = udcs.flatten().next().map(|e| e.file_name().to_string_lossy().into_owned()) {
++                let _ = std::fs::write("/config/usb_gadget/g1/UDC", "");
++                std::thread::sleep(Duration::from_millis(200));
++                let _ = std::fs::write("/config/usb_gadget/g1/UDC", &name);
++            }
++        }
++        let _ = skyward_sys::usb::set("none", Duration::from_secs(4));
++        if skyward_sys::usb::set(skyward_sys::usb::resting(), Duration::from_secs(6)).is_ok() {
++            note(&format!("adb is back on the port after {attempt} tries: {}", port_facts()));
++            return;
++        }
++        note(&format!("try {attempt}: adb not back: {}", port_facts()));
++        std::thread::sleep(Duration::from_millis(700));
++    }
++    note(&format!("adb did not come back: {}", port_facts()));
++}
++
++/// The battery's charge, as a percentage, once the stack is up.
++pub fn capacity() -> Option<u8> {
++    let text = std::fs::read_to_string(Path::new(SUPPLY).join("battery/capacity")).ok()?;
++    text.trim().parse().ok()
++}
 diff --git a/crates/skyward/src/sd.rs b/crates/skyward/src/sd.rs
 new file mode 100644
 index 0000000..0125fb1
@@ -596,10 +1210,18 @@ index 0000000..0125fb1
 +    Ok(())
 +}
 diff --git a/crates/skyward/src/ui.rs b/crates/skyward/src/ui.rs
-index 3144b83..2e94b38 100644
+index 3144b83..d58e02b 100644
 --- a/crates/skyward/src/ui.rs
 +++ b/crates/skyward/src/ui.rs
-@@ -112,13 +112,30 @@ impl Backlight {
+@@ -5,6 +5,7 @@ use crate::haptics::Haptics;
+ use crate::relabel;
+ use crate::input::{monotonic_ms, Event, Inputs};
+ use crate::merge;
++use crate::otg;
+ use crate::partwork;
+ use crate::pty;
+ use crate::readings::{Reading, Readings};
+@@ -112,13 +113,30 @@ impl Backlight {
          };
          let top = normal_max(read("max_brightness")?)?;
          let level = read("brightness")?;
@@ -631,7 +1253,7 @@ index 3144b83..2e94b38 100644
          if raw != self.level {
              fs::write(&self.path, raw.to_string()).with_context(|| format!("write {}", self.path.display()))?;
              eprintln!("backlight {raw}");
-@@ -137,10 +154,13 @@ impl Backlight {
+@@ -137,10 +155,13 @@ impl Backlight {
  /// their factory tests drive the panel to, on the backlight's own scale:
  /// the 13 Ultra's panels give that level as well, and it comes to the same
  /// half of their range as the normal maximum they give.
@@ -646,7 +1268,26 @@ index 3144b83..2e94b38 100644
  ];
  
  /// The raw backlight level, out of `max`, at the panel's normal maximum.
-@@ -1446,12 +1466,23 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request,
+@@ -1045,6 +1066,9 @@ fn wait(fds: &[i32], timeout_ms: i32) -> Result<()> {
+ 
+ /// Run the pages. What `request`, read from misc, asks for decides the
+ /// first of them; asking for nothing, they start at `start`.
++/// What the USB host page says when the configuration has no [otg] section.
++const USB_HOST_NONE: &str = "this phone's configuration has no [otg] section, so the port cannot be given to a stick";
++
+ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, start: Screen, dump: Option<&Path>) -> Result<()> {
+     if cfg.display.density == 0 {
+         return Err(anyhow!("{}: [display] density is required to lay out the UI", cfg.device.codename));
+@@ -1372,6 +1396,8 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request,
+     let mut plugged: Option<Plugged> = None;
+     let mut seen: Option<String> = None;
+     let mut drive_at = Instant::now();
++    // When the port was given to a host, while it is with one.
++    let mut host_since: Option<Instant> = None;
+     loop {
+         let now = monotonic_ms();
+         if leave_at.is_some_and(|at| now >= at) {
+@@ -1446,12 +1472,23 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request,
              if app.take_dirty() || !surface.is_on() {
                  let t0 = Instant::now();
                  app.compose(&mut screen, &fonts, &info, &shown_clock, now);
@@ -675,7 +1316,7 @@ index 3144b83..2e94b38 100644
              }
              blanked = false;
          } else if !blanked {
-@@ -1459,31 +1490,50 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request,
+@@ -1459,31 +1496,50 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request,
              // to 0 and the display off, so an OLED that floors the backlight
              // above zero rather than cutting it shows nothing as it goes off.
              screen.data.fill(0);
@@ -734,6 +1375,51 @@ index 3144b83..2e94b38 100644
              rested_at = None;
          }
          // A page at rest draws the rows it has yet to while nothing else
+@@ -1597,6 +1653,21 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request,
+         if drive_at.elapsed().as_secs() >= 1 {
+             drive_told = look_for_drive(&mut plugged, &mut seen)?;
+             drive_at = Instant::now();
++            // The port is with a stick only while there is one. A stick taken
++            // out — or one that never came — gives the port back, so adb
++            // returns without the user having to find the page again while
++            // the screen has no adb to reach it.
++            if let Some(since) = host_since {
++                let patience = cfg.otg.as_ref().map_or(20, |o| o.wait_seconds);
++                let left = drive_told == Some(None);
++                let never = plugged.is_none() && since.elapsed().as_secs() >= patience;
++                if left || never {
++                    skyward_sys::kmsg("the port goes back to the computer")?;
++                    host_since = None;
++                    app.usb_host_done(false, otg::to_device().map_err(|e| format!("{e:#}")));
++                    drive_told = Some(None);
++                }
++            }
+         }
+         // What the installer and the eraser told comes first, so a touch
+         // acts on the page as it now stands.
+@@ -2268,6 +2339,22 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request,
+                             app.install(cancelled, now);
+                         }
+                     },
++                    Effect::UsbHost(host) => {
++                        if cfg.otg.is_none() {
++                            app.usb_host_done(host, Err(USB_HOST_NONE.to_string()));
++                        } else if host {
++                            match otg::to_host() {
++                                Ok(()) => {
++                                    host_since = Some(Instant::now());
++                                    app.usb_host_done(true, Ok(()));
++                                }
++                                Err(e) => app.usb_host_done(true, Err(format!("{e:#}"))),
++                            }
++                        } else {
++                            host_since = None;
++                            app.usb_host_done(false, otg::to_device().map_err(|e| format!("{e:#}")));
++                        }
++                    }
+                     Effect::ReadMounts => app.set_mounts(mounts()),
+                     Effect::ReadSlots => app.set_boot_slots(read_slots()),
+                     Effect::SetSlot(slot) => app.slot_switched(set_slot(slot), now),
 diff --git a/devices/TB322FC.toml b/devices/TB322FC.toml
 new file mode 100644
 index 0000000..0135d94

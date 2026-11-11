@@ -1,7 +1,7 @@
 use crate::app::{
     Action, BackupAt, BackupEnd, BackupJob, Check, ClashChoice, Confirm, Damage, Data, Dock, DownloadEnd, EraseStop, Field, FileKind,
     FileOp, FileTask, Fold, Folder, Frame, FsAction, FsChoice, FsRow, Have, HeroArt, Hit, Install, JobEnd, Keys, Pick, Place, Rows, Screen,
-    SkywardCheck, SkywardEnd, SkywardJob, SkywardStage, Slider, Source, State, Switch, SystemsWork, Target, UsbDrive, UsbLink, Wipe, ADDABLE,
+    SkywardCheck, SkywardEnd, SkywardJob, SkywardStage, Slider, Source, State, Switch, SystemsWork, Target, UsbDrive, UsbHost, UsbLink, Wipe, ADDABLE,
     BACKUP_PARTS, DATA_ERASED, DATA_PARTITION, DOWNLOADS, FASTBOOT_CHOICES, SCREEN_OFF, TARGETS, TIME_ZONES, USB_DRIVE_UNREADABLE,
     USB_DRIVE_WANTED, WIPES, installs, starting,
 };
@@ -80,6 +80,7 @@ pub fn render(screen: Screen, cx: &Ctx) -> Frame {
         Screen::RestoreBackup => restore_backup(cx),
         Screen::BackupJob => backup_job(cx),
         Screen::Advanced => advanced(cx),
+        Screen::UsbHost => usb_host(cx),
         Screen::Files => files(cx),
         Screen::FileInfo => file_info(cx),
         Screen::Permissions => permissions(cx),
@@ -379,6 +380,13 @@ pub fn settings(cx: &Ctx) -> Frame {
     y = widgets::section(&mut c, t, f, general.bottom, "USB");
     let usb = widgets::list(&mut c, t, f, y, &[Row::new(l.pick(["文件传输", "檔案傳輸", "File transfer"])).icon(BLUE, Icon::Usb).trail(Trail::Switch(s.file_transfer))]);
     out.extend(hits(&usb.rows, &[Action::Toggle(Switch::FileTransfer)]));
+    // The port as a host, on phones whose port can be one: a stick plugged
+    // into it is mounted for the file manager.
+    if cx.info.otg {
+        let state = usb_host_value(l, s);
+        let host = widgets::list(&mut c, t, f, usb.bottom, &[Row::new(l.pick(USB_HOST)).icon(BLUE, Icon::UsbDrive).trail(Trail::Value(&state))]);
+        out.extend(hits(&host.rows, &[Action::Open(Screen::UsbHost)]));
+    }
     let note = l.pick([
         "开启后，可在电脑上管理内部存储中的文件，需先完成「解密」。",
         "開啟後，可在電腦上管理內部儲存空間中的檔案，需先完成「解密」。",
@@ -2217,6 +2225,52 @@ pub fn advanced(cx: &Ctx) -> Frame {
         Action::Open(Screen::Update),
     ]);
     Frame::new(t, c, out, l.pick(ADVANCED), top)
+}
+
+const USB_HOST: Text = ["USB 主机（OTG）", "USB 主機（OTG）", "USB host (OTG)"];
+const USB_HOST_ON: Text = ["接上 U 盘", "接上 U 盤", "Take a USB stick"];
+const USB_HOST_OFF: Text = ["还给电脑", "還給電腦", "Give the port back"];
+
+/// What the settings row says of the port.
+fn usb_host_value(l: Lang, s: &State) -> &'static str {
+    match &s.usb_host {
+        UsbHost::Idle | UsbHost::Done { host: false, .. } => l.pick(["关", "關", "Off"]),
+        UsbHost::Working(_) => l.pick(["切换中", "切換中", "Switching"]),
+        UsbHost::Done { host: true, .. } => l.pick(["已接上", "已接上", "On"]),
+        UsbHost::Failed(_) => l.pick(["失败", "失敗", "Failed"]),
+    }
+}
+
+/// The port as a host: a stick plugged into it is found by the recovery and
+/// shown in the file manager, at the cost of adb and file transfer while it
+/// is there.
+pub fn usb_host(cx: &Ctx) -> Frame {
+    let (t, f, l) = (cx.t, cx.f, cx.state.lang);
+    let mut c = page(cx);
+    let top = t.m.content_top;
+    let rows = widgets::list(&mut c, t, f, top, &[
+        Row::new(l.pick(USB_HOST_ON)).icon(BLUE, Icon::UsbDrive),
+        Row::new(l.pick(USB_HOST_OFF)).icon(SLATE, Icon::Usb),
+    ]);
+    let out = hits(&rows.rows, &[Action::UsbHost(true), Action::UsbHost(false)]);
+    let note = match &cx.state.usb_host {
+        UsbHost::Idle => l.pick([
+            "这个口同一时间只做一件事：接上 U 盘时 adb 与文件传输会断开，U 盘拔掉后自动还给电脑。",
+            "這個埠同一時間只做一件事：接上 U 盤時 adb 與檔案傳輸會斷開，U 盤拔掉後自動還給電腦。",
+            "The port does one thing at a time: with a stick on it adb and file transfer are off, and it goes back to the computer once the stick is taken out.",
+        ]).to_string(),
+        UsbHost::Working(true) => l.pick(["正在把端口交给 USB 主机…", "正在把埠交給 USB 主機…", "Giving the port to a host…"]).to_string(),
+        UsbHost::Working(false) => l.pick(["正在把端口还给电脑…", "正在把埠還給電腦…", "Giving the port back…"]).to_string(),
+        UsbHost::Done { host: true } => l.pick([
+            "端口已交给 USB 主机。插上 U 盘后，在「高级 → 文件管理」的根目录里打开它；U 盘拔掉后端口会自动还给电脑。",
+            "埠已交給 USB 主機。插上 U 盤後，在「進階 → 檔案管理」的根目錄裡打開它；U 盤拔掉後埠會自動還給電腦。",
+            "The port is with a USB host. Plug the stick in and open it from the root of Advanced → File manager; the port goes back to the computer once the stick is taken out.",
+        ]).to_string(),
+        UsbHost::Done { host: false } => l.pick(["端口已还给电脑，adb 与文件传输已恢复。", "埠已還給電腦，adb 與檔案傳輸已恢復。", "The port is back with the computer: adb and file transfer work again."]).to_string(),
+        UsbHost::Failed(text) => text.clone(),
+    };
+    widgets::footnote(&mut c, t, f, rows.bottom, &note);
+    Frame::new(t, c, out, l.pick(USB_HOST), top)
 }
 
 const RELABEL: Text = ["修复 SELinux 上下文", "修復 SELinux 上下文", "Fix SELinux contexts"];

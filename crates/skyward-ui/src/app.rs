@@ -62,6 +62,8 @@ pub enum Screen {
     BackupJob,
     /// Tools for the experienced: files, a terminal, the logs.
     Advanced,
+    /// The port as a host, for a USB stick plugged into it.
+    UsbHost,
     Files,
     /// One file, and what can be done with it.
     FileInfo,
@@ -1185,6 +1187,8 @@ pub enum Action {
     Pattern,
     /// Start receiving a package over USB.
     Sideload,
+    /// Give the port to a USB stick, or give it back to the computer.
+    UsbHost(bool),
     /// Send the image to one of the partitions it fits.
     FlashPartition(usize),
     /// Send the image to these slots.
@@ -1571,6 +1575,22 @@ impl Frame {
     }
 }
 
+/// What the USB host page last asked the runtime for, and how it went.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum UsbHost {
+    /// The page has not been used since the recovery started.
+    #[default]
+    Idle,
+    /// The runtime is moving the port, to a stick when true and back to the
+    /// computer when false.
+    Working(bool),
+    /// The port is with a stick when true, and back with the computer when
+    /// false.
+    Done { host: bool },
+    /// It did not work, and this is why.
+    Failed(String),
+}
+
 /// Choices the pages show and the user changes, and where installing
 /// stands.
 #[derive(Clone, Debug, PartialEq)]
@@ -1628,6 +1648,9 @@ pub struct State {
     /// it could not.
     pub mounts: Result<Vec<MountRow>, String>,
     pub mount_failure: Option<MountFailure>,
+    /// The port as a host: what the USB host page last asked for and how it
+    /// went. Nothing of it is kept in the settings: it describes this run.
+    pub usb_host: UsbHost,
     /// Which of [`BACKUP_PARTS`] a backup takes.
     pub backup: [bool; 4],
     /// Where a backup goes.
@@ -1781,6 +1804,7 @@ impl Default for State {
             reflash: None,
             mounts: Ok(Vec::new()),
             mount_failure: None,
+            usb_host: UsbHost::Idle,
             backup: [true, true, false, true],
             backup_to: Place::Storage,
             compress: false,
@@ -1966,6 +1990,9 @@ pub enum Effect {
     FileTransfer(bool),
     /// Start receiving a package over USB.
     Sideload,
+    /// Give the port to a USB stick, or give it back to the computer,
+    /// telling how it went with [`App::usb_host_done`].
+    UsbHost(bool),
     /// Start installing the file at this path from the top of a place,
     /// telling how it goes as [`Effect::Sideload`] does.
     InstallFile(Place, String),
@@ -3311,6 +3338,22 @@ impl App {
             self.state.mounts = mounts;
             self.refresh();
         }
+    }
+
+    /// The USB host page asked for the port: it is being moved, to a stick
+    /// when `host`, and back to the computer otherwise.
+    pub fn usb_host_working(&mut self, host: bool) {
+        self.state.usb_host = UsbHost::Working(host);
+        self.refresh();
+    }
+
+    /// How giving the port to a stick, or back to the computer, went.
+    pub fn usb_host_done(&mut self, host: bool, outcome: Result<(), String>) {
+        self.state.usb_host = match outcome {
+            Ok(()) => UsbHost::Done { host },
+            Err(text) => UsbHost::Failed(text),
+        };
+        self.refresh();
     }
 
     /// The runtime read whether fastbootd runs and how far a computer has
@@ -5213,6 +5256,10 @@ impl App {
             }
             Action::Confirm(_) => self.say(l.pick(["请按住圆形按钮向右滑动", "請按住圓形按鈕向右滑動", "Hold the round button and slide it right"]), now),
             Action::Slider(_) | Action::Pattern => {}
+            Action::UsbHost(host) => {
+                self.usb_host_working(host);
+                return vec![Effect::UsbHost(host)];
+            }
             Action::Sideload => match self.state.install {
                 Install::Idle | Install::Finished { .. } => {
                     self.begin_install(Install::Starting, Source::Computer, None);

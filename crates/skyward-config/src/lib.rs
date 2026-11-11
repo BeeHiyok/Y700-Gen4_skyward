@@ -85,6 +85,12 @@ pub struct DeviceConfig {
     /// itself, since a recovery's table names no card.
     #[serde(default)]
     pub sd: Option<Sd>,
+    /// The port as a host, for a USB stick, on phones whose port can be one.
+    #[serde(default)]
+    pub otg: Option<Otg>,
+    /// Charging while the recovery runs, where the phone would otherwise not.
+    #[serde(default)]
+    pub power: Power,
     /// Where the phone maker answers which system is the newest, on phones
     /// whose server the recovery knows.
     #[serde(default)]
@@ -130,6 +136,36 @@ pub struct Sd {
 
 fn sd_wait_seconds() -> u64 {
     8
+}
+
+/// The port as a host, for a USB stick plugged into it. A phone's port is
+/// either a device or a host, never both, so the recovery gives it to a
+/// stick only when asked, and gives it back afterwards. A phone whose
+/// Type-C controller is driven by software the installed system runs does
+/// not switch by itself in a recovery, which is what this is for.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Otg {
+    /// How long to wait for a stick to appear before giving the port back,
+    /// in seconds.
+    #[serde(default = "otg_wait_seconds")]
+    pub wait_seconds: u64,
+}
+
+fn otg_wait_seconds() -> u64 {
+    20
+}
+
+/// The charger firmware on the ADSP, which a recovery does not run.
+///
+/// Without it the phone does not charge at all: the port draws no current,
+/// whatever the cable. With it, charging works but on phones whose Type-C
+/// controller then takes the port for charging alone, adb is gone. So the
+/// recovery starts it only when the owner asks for charging.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+pub struct Power {
+    /// Start it, and let the phone charge while the recovery runs.
+    #[serde(default)]
+    pub charge: bool,
 }
 
 /// What brings the phone's WLAN up inside a recovery, which loads none of
@@ -637,6 +673,9 @@ impl DeviceConfig {
             let plain = at.components().all(|c| matches!(c, std::path::Component::Normal(_) | std::path::Component::RootDir));
             ensure!(at.is_absolute() && plain && sd.mount != "/", "[sd] mount: {} is not an absolute path to a folder", sd.mount);
             ensure!(sd.wait_seconds <= 120, "[sd] wait_seconds: {} is longer than two minutes", sd.wait_seconds);
+        }
+        if let Some(otg) = &cfg.otg {
+            ensure!((5..=120).contains(&otg.wait_seconds), "[otg] wait_seconds: {} is not from 5 to 120", otg.wait_seconds);
         }
         if let Some(wlan) = &cfg.wlan {
             ensure!(wlan.probe.starts_with("http://"), "[wlan] probe: {} is not a plain HTTP address", wlan.probe);
