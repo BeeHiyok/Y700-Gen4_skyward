@@ -104,8 +104,11 @@ Skyward 自带的分区备份 / 恢复、OTA 包安装、擦除、SELinux 上下
 ```text
 skyward-v0.2.0-TB322FC-recovery.img
 大小     104857600 字节（整分区）
-SHA-256  3fca684f2bfa559f2fd5df709eb67b8416e60ff7ac224e8fc0c507d6c6894665
+SHA-256  4d29e75849f14a5caf14677d4543da9c7997414869d9def109546a8038cf656a
 ```
+
+> 这个镜像是 `[power] charge = false`（保 adb、不充电）。需要充电时把配置里的
+> `charge` 改成 `true` 重新打包，见「充电与 OTG」一节。
 
 ```bash
 # 校验
